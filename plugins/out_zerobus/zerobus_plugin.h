@@ -27,6 +27,9 @@
 /* Include Zerobus Rust SDK FFI header */
 #include "zerobus.h"
 
+/* Companion FFI: Unity Catalog schema -> protobuf descriptor + record encoder */
+#include "zerobus_uc_ffi.h"
+
 #define FLB_ZEROBUS_DEFAULT_ENDPOINT "https://zerobus.example.com"
 
 /* Zerobus RecordType enum values (from Go SDK types.go) */
@@ -48,10 +51,22 @@ struct flb_zerobus_context {
     flb_sds_t unity_catalog_endpoint;
     flb_sds_t table_name;
 
-    /* Protobuf schema descriptor (optional; unused in JSON mode) */
-    flb_sds_t schema_descriptor_file;
-    uint8_t *descriptor_bytes;
-    size_t descriptor_len;
+    /*
+     * Record format: "protobuf" (default) fetches the table schema from Unity
+     * Catalog, derives a protobuf descriptor, and ingests protobuf-encoded
+     * records (the Vector sink's approach). "json" ingests JSON records and
+     * needs no descriptor.
+     */
+    flb_sds_t record_format;
+    int use_protobuf;            /* derived from record_format */
+
+    /*
+     * Protobuf schema handle. Owns the serialized DescriptorProto handed to the
+     * SDK at stream creation and the message descriptor used to encode each
+     * record. NULL in JSON mode. Built from the Unity Catalog schema in
+     * cb_zerobus_init via the companion FFI crate.
+     */
+    struct ZbUcSchema *uc_schema;
 
     /* Plugin instance */
     struct flb_output_instance *ins;

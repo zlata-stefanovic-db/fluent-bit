@@ -1,0 +1,29 @@
+# NOTE: This is a CMake template. The build generates `Cargo.toml` from it,
+# substituting @ZEROBUS_SDK_ROOT@ with the Zerobus SDK location. Do not edit the
+# generated Cargo.toml by hand; edit this template instead.
+[package]
+name = "zerobus_uc_ffi"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+# cdylib (not staticlib): this crate and the prebuilt libzerobus_ffi.a are two
+# independent Rust artifacts. Linking two Rust *staticlibs* into one binary
+# collides on the std runtime symbols; a cdylib keeps its Rust world private and
+# only exports the #[no_mangle] entry points below.
+crate-type = ["cdylib"]
+
+[dependencies]
+# Reuse the SDK's battle-tested UC-schema -> protobuf descriptor conversion
+# (the exact code the Vector sink calls via descriptor_from_uc_schema).
+databricks-zerobus-ingest-sdk = { path = "@ZEROBUS_SDK_ROOT@/rust/sdk" }
+# Versions pinned to the SDK workspace so there is a single prost*/prost-reflect
+# in the dependency graph (prost 0.14.x, prost-reflect 0.16.x).
+prost = "0.14"
+prost-reflect = { version = "0.16", features = ["serde"] }
+serde_json = "1"
+
+[profile.release]
+# Keep the artifact lean; this crate is pure glue.
+opt-level = 2

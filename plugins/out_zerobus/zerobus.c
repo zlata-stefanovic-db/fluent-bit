@@ -26,66 +26,54 @@
 #include <fluent-bit/flb_pack.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 
 /* Include plugin context header (which includes Zerobus SDK) */
 #include "zerobus_plugin.h"
+#include "unity_catalog.h"
 
-/* Helper function to load protobuf descriptor from file */
-static int load_descriptor_file(struct flb_output_instance *ins,
-                                struct flb_zerobus_context *ctx)
+/*
+ * Fetch the Delta table schema from Unity Catalog and build the protobuf
+ * descriptor handle (stored in ctx->uc_schema). On success, *desc_bytes /
+ * *desc_len point at the serialized DescriptorProto owned by the handle (valid
+ * until the handle is freed) - pass these to zerobus_sdk_create_stream().
+ */
+static int build_protobuf_schema(struct flb_output_instance *ins,
+                                 struct flb_config *config,
+                                 struct flb_zerobus_context *ctx,
+                                 const char *client_id,
+                                 const char *client_secret,
+                                 const uint8_t **desc_bytes,
+                                 size_t *desc_len)
 {
-    FILE *fp;
-    long file_size;
-    size_t bytes_read;
+    int ret;
+    flb_sds_t schema_json = NULL;
+    char *err = NULL;
 
-    /*
-     * The descriptor is only needed for protobuf streams. In JSON mode (the
-     * mode this plugin currently uses) it is unused, so a missing file is not
-     * an error - we simply skip loading it.
-     */
-    if (!ctx->schema_descriptor_file) {
-        return 0;
-    }
-
-    fp = fopen(ctx->schema_descriptor_file, "rb");
-    if (!fp) {
-        flb_plg_error(ins, "failed to open schema descriptor file: %s",
-                      ctx->schema_descriptor_file);
+    ret = uc_fetch_table_schema_json(ins, config,
+                                     ctx->unity_catalog_endpoint,
+                                     ctx->table_name,
+                                     client_id, client_secret,
+                                     &schema_json);
+    if (ret != 0) {
         return -1;
     }
 
-    /* Get file size */
-    fseek(fp, 0, SEEK_END);
-    file_size = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-
-    if (file_size <= 0 || file_size > 10 * 1024 * 1024) {
-        flb_plg_error(ins, "invalid descriptor file size: %ld bytes", file_size);
-        fclose(fp);
+    ret = zb_uc_schema_from_table_json(schema_json, &ctx->uc_schema,
+                                       desc_bytes, desc_len, &err);
+    flb_sds_destroy(schema_json);
+    if (ret != 0) {
+        flb_plg_error(ins, "failed to build protobuf descriptor: %s",
+                      err ? err : "unknown error");
+        if (err) {
+            zb_uc_free_err(err);
+        }
         return -1;
     }
 
-    /* Allocate buffer */
-    ctx->descriptor_bytes = flb_malloc(file_size);
-    if (!ctx->descriptor_bytes) {
-        flb_plg_error(ins, "failed to allocate memory for descriptor");
-        fclose(fp);
-        return -1;
-    }
-
-    /* Read file */
-    bytes_read = fread(ctx->descriptor_bytes, 1, file_size, fp);
-    fclose(fp);
-
-    if (bytes_read != (size_t) file_size) {
-        flb_plg_error(ins, "failed to read descriptor file");
-        flb_free(ctx->descriptor_bytes);
-        ctx->descriptor_bytes = NULL;
-        return -1;
-    }
-
-    ctx->descriptor_len = file_size;
-    flb_plg_info(ins, "loaded schema descriptor: %zu bytes", ctx->descriptor_len);
+    flb_plg_info(ins,
+                 "built protobuf descriptor from Unity Catalog schema (%zu bytes)",
+                 *desc_len);
     return 0;
 }
 
@@ -150,11 +138,16 @@ static int cb_zerobus_init(struct flb_output_instance *ins,
         return -1;
     }
 
-    /* Load protobuf schema descriptor (optional; unused in JSON mode) */
-    ret = load_descriptor_file(ins, ctx);
-    if (ret == -1) {
-        flb_free(ctx);
-        return -1;
+    /*
+     * Record format. Default is protobuf: fetch the table schema from Unity
+     * Catalog and ingest protobuf-encoded records (matching the Vector sink).
+     * "json" keeps the schemaless JSON ingestion path.
+     */
+    if (ctx->record_format && strcasecmp(ctx->record_format, "json") == 0) {
+        ctx->use_protobuf = FLB_FALSE;
+    }
+    else {
+        ctx->use_protobuf = FLB_TRUE;
     }
 
     /*
@@ -208,6 +201,8 @@ static int cb_zerobus_init(struct flb_output_instance *ins,
     {
         char *client_id = NULL;
         char *client_secret = NULL;
+        const uint8_t *descriptor = NULL;
+        size_t descriptor_len = 0;
         struct CResult stream_result = {0};
         struct CStreamConfigurationOptions options = zerobus_get_default_config();
 
@@ -216,17 +211,45 @@ static int cb_zerobus_init(struct flb_output_instance *ins,
             client_secret = ctx->oauth2_config.client_secret;
         }
 
-        /* JSON mode: no protobuf descriptor needed */
-        options.record_type = FLB_ZEROBUS_RECORD_TYPE_JSON;
+        if (ctx->use_protobuf) {
+            /*
+             * Protobuf mode: fetch the table schema from Unity Catalog and build
+             * the descriptor. This needs the service-principal credentials (for
+             * the UC OAuth2 exchange), the same ones the SDK uses for the stream.
+             */
+            if (!client_id || !client_secret) {
+                flb_plg_error(ins, "protobuf mode requires oauth2.client_id and "
+                              "oauth2.client_secret to fetch the Unity Catalog "
+                              "schema (or set record_format json)");
+                zerobus_sdk_free(ctx->zerobus_sdk);
+                flb_free(ctx);
+                return -1;
+            }
 
-        flb_plg_info(ins, "creating Zerobus stream for table: %s (JSON mode)",
-                     ctx->table_name);
+            if (build_protobuf_schema(ins, config, ctx,
+                                      client_id, client_secret,
+                                      &descriptor, &descriptor_len) != 0) {
+                zerobus_sdk_free(ctx->zerobus_sdk);
+                flb_free(ctx);
+                return -1;
+            }
+
+            options.record_type = FLB_ZEROBUS_RECORD_TYPE_PROTO;
+            flb_plg_info(ins, "creating Zerobus stream for table: %s (protobuf mode)",
+                         ctx->table_name);
+        }
+        else {
+            /* JSON mode: no protobuf descriptor needed */
+            options.record_type = FLB_ZEROBUS_RECORD_TYPE_JSON;
+            flb_plg_info(ins, "creating Zerobus stream for table: %s (JSON mode)",
+                         ctx->table_name);
+        }
 
         ctx->zerobus_stream = zerobus_sdk_create_stream(
             ctx->zerobus_sdk,
             ctx->table_name,
-            NULL,  /* descriptor - NULL for JSON mode */
-            0,     /* descriptor_len */
+            descriptor,      /* NULL in JSON mode */
+            descriptor_len,  /* 0 in JSON mode */
             client_id,
             client_secret,
             &options,
@@ -240,8 +263,11 @@ static int cb_zerobus_init(struct flb_output_instance *ins,
             if (stream_result.error_message) {
                 zerobus_free_error_message(stream_result.error_message);
             }
+            if (ctx->uc_schema) {
+                zb_uc_schema_free(ctx->uc_schema);
+                ctx->uc_schema = NULL;
+            }
             zerobus_sdk_free(ctx->zerobus_sdk);
-            flb_free(ctx->descriptor_bytes);
             flb_free(ctx);
             return -1;
         }
@@ -353,22 +379,107 @@ static void cb_zerobus_flush(struct flb_event_chunk *event_chunk,
 
     flb_log_event_decoder_destroy(&log_decoder);
 
-    /* Ingest JSON records via Zerobus SDK */
+    /* Ingest the batch via the Zerobus SDK */
     struct CResult ingest_result = {0};
-    last_offset = zerobus_stream_ingest_json_records(
-        ctx->zerobus_stream,
-        (const char *const *) json_records,
-        record_count,
-        &ingest_result
-    );
 
-    /* Cleanup allocated JSON strings */
-    for (int i = 0; i < record_count; i++) {
-        if (json_records[i]) {
-            flb_free(json_records[i]);
+    if (ctx->use_protobuf) {
+        /*
+         * Protobuf mode: encode each JSON record into protobuf bytes that match
+         * the Unity Catalog-derived descriptor, then ingest the encoded batch.
+         */
+        uint8_t **proto_records;
+        size_t *proto_lens;
+        int encoded = 0;
+
+        proto_records = flb_calloc(record_count, sizeof(uint8_t *));
+        proto_lens = flb_calloc(record_count, sizeof(size_t));
+        if (!proto_records || !proto_lens) {
+            flb_plg_error(ctx->ins, "failed to allocate protobuf record arrays");
+            if (proto_records) {
+                flb_free(proto_records);
+            }
+            if (proto_lens) {
+                flb_free(proto_lens);
+            }
+            for (int i = 0; i < record_count; i++) {
+                if (json_records[i]) {
+                    flb_free(json_records[i]);
+                }
+            }
+            flb_free(json_records);
+            FLB_OUTPUT_RETURN(FLB_RETRY);
         }
+
+        for (int i = 0; i < record_count; i++) {
+            uint8_t *pb = NULL;
+            size_t pl = 0;
+            char *err = NULL;
+
+            if (zb_uc_encode_json(ctx->uc_schema, json_records[i],
+                                  &pb, &pl, &err) == 0) {
+                proto_records[encoded] = pb;
+                proto_lens[encoded] = pl;
+                encoded++;
+            }
+            else {
+                /*
+                 * A record that does not fit the table schema can never ingest,
+                 * so drop it and keep the rest of the batch rather than failing
+                 * (and retrying) the whole chunk forever.
+                 */
+                flb_plg_warn(ctx->ins, "skipping record %d: %s", i,
+                             err ? err : "protobuf encode failed");
+                if (err) {
+                    zb_uc_free_err(err);
+                }
+            }
+        }
+
+        /* JSON strings are no longer needed once encoded */
+        for (int i = 0; i < record_count; i++) {
+            if (json_records[i]) {
+                flb_free(json_records[i]);
+            }
+        }
+        flb_free(json_records);
+
+        if (encoded == 0) {
+            flb_plg_warn(ctx->ins, "no records in chunk could be encoded to protobuf");
+            flb_free(proto_records);
+            flb_free(proto_lens);
+            FLB_OUTPUT_RETURN(FLB_OK);
+        }
+
+        last_offset = zerobus_stream_ingest_proto_records(
+            ctx->zerobus_stream,
+            (const uint8_t *const *) proto_records,
+            (const uintptr_t *) proto_lens,
+            encoded,
+            &ingest_result
+        );
+        record_count = encoded;
+
+        for (int i = 0; i < encoded; i++) {
+            zb_uc_free_bytes(proto_records[i], proto_lens[i]);
+        }
+        flb_free(proto_records);
+        flb_free(proto_lens);
     }
-    flb_free(json_records);
+    else {
+        last_offset = zerobus_stream_ingest_json_records(
+            ctx->zerobus_stream,
+            (const char *const *) json_records,
+            record_count,
+            &ingest_result
+        );
+
+        for (int i = 0; i < record_count; i++) {
+            if (json_records[i]) {
+                flb_free(json_records[i]);
+            }
+        }
+        flb_free(json_records);
+    }
 
     /* Check ingestion result */
     if (!ingest_result.success) {
@@ -417,16 +528,17 @@ static int cb_zerobus_exit(void *data, struct flb_config *config)
         zerobus_sdk_free(ctx->zerobus_sdk);
     }
 
-    /*
-     * ingestion_endpoint, unity_catalog_endpoint, table_name,
-     * schema_descriptor_file and the oauth2_config strings are all populated
-     * through the config map, so flb_config_map_destroy() owns their release.
-     * Freeing them here would double-free and abort (free(): invalid pointer).
-     */
-
-    if (ctx->descriptor_bytes) {
-        flb_free(ctx->descriptor_bytes);
+    /* Free the protobuf schema handle (owns the descriptor + message descriptor) */
+    if (ctx->uc_schema) {
+        zb_uc_schema_free(ctx->uc_schema);
     }
+
+    /*
+     * ingestion_endpoint, unity_catalog_endpoint, table_name, record_format and
+     * the oauth2_config strings are all populated through the config map, so
+     * flb_config_map_destroy() owns their release. Freeing them here would
+     * double-free and abort (free(): invalid pointer).
+     */
 
     flb_free(ctx);
     return 0;
@@ -450,9 +562,10 @@ static struct flb_config_map config_map[] = {
      "Full table name in format: catalog.schema.table (required)"
     },
     {
-     FLB_CONFIG_MAP_STR, "schema_descriptor_file", NULL,
-     0, FLB_TRUE, offsetof(struct flb_zerobus_context, schema_descriptor_file),
-     "Path to protobuf FileDescriptorSet file (required for protobuf mode)"
+     FLB_CONFIG_MAP_STR, "record_format", "protobuf",
+     0, FLB_TRUE, offsetof(struct flb_zerobus_context, record_format),
+     "Record encoding: 'protobuf' (default; fetches the table schema from Unity "
+     "Catalog and ingests protobuf records) or 'json' (schemaless JSON ingestion)"
     },
 
     /* EOF */

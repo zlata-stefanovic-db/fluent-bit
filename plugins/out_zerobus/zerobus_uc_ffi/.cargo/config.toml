@@ -1,0 +1,25 @@
+# Route crates.io through the Databricks internal crates proxy. This box (and
+# CI) cannot reach crates.io directly; the proxy mirrors it (and filters crate
+# versions younger than 7 days as a supply-chain measure). Mirrors the canonical
+# universe config at universe/third_party/rust/config.toml so a standalone
+# `cargo build` of this crate resolves dependencies the same way.
+#
+# Cargo discovers this file because CMake runs `cargo` with this crate directory
+# as the working directory. If you build the crate from elsewhere, point cargo
+# here with `--config <path-to-this-file>` or add the same stanza to
+# ~/.cargo/config.toml.
+
+net.git-fetch-with-cli = true
+# The proxy is slower than crates.io directly; allow more retries for transient
+# timeouts during dependency resolution.
+net.retry = 5
+
+[http]
+# The proxy fetches upstream on cache misses, which can exceed the default 30s.
+timeout = 120
+
+[source.crates-io]
+replace-with = "databricks-proxy"
+
+[source.databricks-proxy]
+registry = "sparse+https://crates-proxy.cloud.databricks.com/"
