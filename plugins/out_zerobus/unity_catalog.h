@@ -33,9 +33,9 @@
  *           with "Authorization: Bearer <token>"
  *
  * The returned JSON (the table-metadata object, which includes the `columns`
- * array) is handed verbatim to the companion crate's
- * zb_uc_schema_from_table_json(), whose UcTableSchema deserializer ignores the
- * fields it does not need.
+ * array) is handed verbatim to the Zerobus SDK FFI's
+ * zerobus_proto_schema_from_uc_json(), whose UcTableSchema deserializer ignores
+ * the fields it does not need.
  *
  * Parameters:
  *   ins:           plugin instance (logging + TLS settings)

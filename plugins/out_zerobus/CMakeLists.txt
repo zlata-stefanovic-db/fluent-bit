@@ -1,45 +1,89 @@
-set(ZEROBUS_SDK_ROOT "$ENV{HOME}/zerobus-sdk")
-set(ZEROBUS_FFI_INCLUDE "${ZEROBUS_SDK_ROOT}/rust/ffi")
-set(ZEROBUS_FFI_LIB "${ZEROBUS_SDK_ROOT}/go/lib/linux_amd64/libzerobus_ffi.a")
+# ---------------------------------------------------------------------------
+# Zerobus SDK source
+#
+# The SDK (including its C FFI) is pulled from a pinned Git commit that exposes
+# the dynamic protobuf-schema functions (zerobus_proto_schema_*). CMake fetches
+# that exact commit and builds the FFI static library from source with cargo,
+# because the prebuilt libzerobus_ffi.a committed in the repo does not (yet)
+# contain those new symbols. Building from source guarantees the linked library
+# matches the commit's headers.
+#
+# Override the commit/repo (or point at a local checkout) with -D flags:
+#   -DZEROBUS_SDK_GIT_URL=... -DZEROBUS_SDK_GIT_REF=<sha|branch|tag>
+#   -DZEROBUS_SDK_DIR=/path/to/existing/checkout   (skips the fetch)
+# ---------------------------------------------------------------------------
+set(ZEROBUS_SDK_GIT_URL "https://github.com/databricks/zerobus-sdk.git"
+    CACHE STRING "Zerobus SDK git repository")
+# Pinned to an exact commit for reproducible builds: the head of the dynamic
+# protobuf-schema C FFI branch (databricks/zerobus-sdk#371). Bump this SHA to
+# pick up SDK changes; after #371 merges, repoint at the merge commit on main.
+set(ZEROBUS_SDK_GIT_REF "a5b7efa280950949c513a49dacbdab239d45947a"
+    CACHE STRING "Zerobus SDK git commit (SHA, branch, or tag)")
+set(ZEROBUS_SDK_DIR "${CMAKE_CURRENT_BINARY_DIR}/zerobus-sdk"
+    CACHE PATH "Zerobus SDK checkout location")
 
-# ---------------------------------------------------------------------------
-# Companion Rust FFI crate (zerobus_uc_ffi)
-#
-# Bridges the two operations the prebuilt C FFI does not expose: building a
-# protobuf descriptor from a Unity Catalog schema, and encoding a record into
-# protobuf bytes. It links the Zerobus SDK as a *library* (a path dependency, the
-# same way the Vector sink consumes it) and is built as a cdylib so its private
-# Rust runtime does not collide with the prebuilt libzerobus_ffi.a static lib.
-#
-# NOTE: building this crate fetches its dependencies from crates.io (or your
-# configured registry mirror), so the build host needs network/registry access.
-# ---------------------------------------------------------------------------
-set(UC_FFI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/zerobus_uc_ffi")
-set(UC_FFI_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/zerobus_uc_ffi_target")
-set(UC_FFI_LIB "${UC_FFI_TARGET_DIR}/release/libzerobus_uc_ffi.so")
+set(ZEROBUS_FFI_INCLUDE "${ZEROBUS_SDK_DIR}/rust/ffi")
+set(ZEROBUS_FFI_LIB "${ZEROBUS_SDK_DIR}/rust/target/release/libzerobus_ffi.a")
 
 find_program(CARGO_EXECUTABLE cargo
              HINTS "$ENV{HOME}/.cargo/bin" "$ENV{CARGO_HOME}/bin")
 if(NOT CARGO_EXECUTABLE)
     message(FATAL_ERROR
             "cargo not found; the out_zerobus plugin needs the Rust toolchain "
-            "to build the zerobus_uc_ffi companion crate")
+            "to build the Zerobus SDK FFI from source")
 endif()
 
-# Generate Cargo.toml from the template, substituting the SDK path dependency.
-configure_file("${UC_FFI_DIR}/Cargo.toml.in" "${UC_FFI_DIR}/Cargo.toml" @ONLY)
+# Fetch the pinned SDK commit at configure time (once) so the FFI header path
+# resolves. `git clone --branch` only accepts branch/tag names, so to pin an
+# exact SHA we init + shallow-fetch that commit + checkout it (GitHub allows
+# fetching an arbitrary commit by hash).
+if(NOT EXISTS "${ZEROBUS_SDK_DIR}/rust/ffi/zerobus.h")
+    message(STATUS "out_zerobus: fetching Zerobus SDK ${ZEROBUS_SDK_GIT_REF} from ${ZEROBUS_SDK_GIT_URL}")
+    execute_process(
+        COMMAND git init -q ${ZEROBUS_SDK_DIR}
+        RESULT_VARIABLE _zb_result)
+    if(_zb_result EQUAL 0)
+        execute_process(
+            COMMAND git -C ${ZEROBUS_SDK_DIR} remote add origin ${ZEROBUS_SDK_GIT_URL}
+            RESULT_VARIABLE _zb_result)
+    endif()
+    if(_zb_result EQUAL 0)
+        execute_process(
+            COMMAND git -C ${ZEROBUS_SDK_DIR} fetch --depth 1 origin ${ZEROBUS_SDK_GIT_REF}
+            RESULT_VARIABLE _zb_result)
+    endif()
+    if(_zb_result EQUAL 0)
+        execute_process(
+            COMMAND git -C ${ZEROBUS_SDK_DIR} checkout -q FETCH_HEAD
+            RESULT_VARIABLE _zb_result)
+    endif()
+    if(NOT _zb_result EQUAL 0)
+        message(FATAL_ERROR "out_zerobus: failed to fetch Zerobus SDK commit ${ZEROBUS_SDK_GIT_REF}")
+    endif()
+endif()
 
+# This box (and CI) cannot reach crates.io directly; route the SDK build through
+# the Databricks crate proxy (same mirror as universe/third_party/rust/config.toml).
+file(WRITE "${ZEROBUS_SDK_DIR}/rust/.cargo/config.toml"
+"net.git-fetch-with-cli = true
+net.retry = 5
+[http]
+timeout = 120
+[source.crates-io]
+replace-with = \"databricks-proxy\"
+[source.databricks-proxy]
+registry = \"sparse+https://crates-proxy.cloud.databricks.com/\"
+")
+
+# Build the FFI static library from the cloned source (contains the
+# zerobus_proto_schema_* symbols the plugin calls).
 add_custom_command(
-    OUTPUT "${UC_FFI_LIB}"
-    COMMAND ${CMAKE_COMMAND} -E env "CARGO_TARGET_DIR=${UC_FFI_TARGET_DIR}"
-            ${CARGO_EXECUTABLE} build --release
-            --manifest-path "${UC_FFI_DIR}/Cargo.toml"
-    DEPENDS "${UC_FFI_DIR}/src/lib.rs" "${UC_FFI_DIR}/Cargo.toml.in"
-    WORKING_DIRECTORY "${UC_FFI_DIR}"
-    COMMENT "Building zerobus_uc_ffi companion crate (cargo)"
-    VERBATIM
-)
-add_custom_target(zerobus_uc_ffi_build DEPENDS "${UC_FFI_LIB}")
+    OUTPUT "${ZEROBUS_FFI_LIB}"
+    COMMAND ${CARGO_EXECUTABLE} build --release -p zerobus-ffi
+    WORKING_DIRECTORY "${ZEROBUS_SDK_DIR}/rust"
+    COMMENT "Building Zerobus SDK FFI from ${ZEROBUS_SDK_GIT_REF} (cargo)"
+    VERBATIM)
+add_custom_target(zerobus_ffi_build DEPENDS "${ZEROBUS_FFI_LIB}")
 
 set(src
     zerobus.c
@@ -47,34 +91,23 @@ set(src
 
 FLB_PLUGIN(out_zerobus "${src}" "")
 
-# The plugin links the companion crate; make sure it is built first.
-add_dependencies(flb-plugin-out_zerobus zerobus_uc_ffi_build)
+# Make sure the SDK FFI library is built (and the header is present) before the
+# plugin compiles/links.
+add_dependencies(flb-plugin-out_zerobus zerobus_ffi_build)
 
-# Add Zerobus SDK include directory
 target_include_directories(flb-plugin-out_zerobus PRIVATE
     ${ZEROBUS_FFI_INCLUDE}
 )
 
-# Link Zerobus SDK static library, the companion crate, and required system
-# libraries. The system libs match the link flags the Zerobus Go SDK uses for
-# linux on its cgo directive (libzerobus_ffi.a -ldl -lpthread -lm -lresolv
-# -lgcc_s); resolv and gcc_s resolve the static lib's DNS and stack-unwind
-# symbols. Linking ${UC_FFI_LIB} by its full path in the build tree makes CMake
-# add its directory to the final binary's RPATH automatically.
+# Link the Zerobus SDK FFI static library and the system libraries its Rust code
+# needs. These match the link flags the Zerobus Go SDK uses for linux on its cgo
+# directive (libzerobus_ffi.a -ldl -lpthread -lm -lresolv -lgcc_s); resolv and
+# gcc_s resolve the static lib's DNS and stack-unwind symbols.
 target_link_libraries(flb-plugin-out_zerobus
     ${ZEROBUS_FFI_LIB}
-    ${UC_FFI_LIB}
     pthread
     dl
     m
     resolv
     gcc_s
-)
-
-# libzerobus_uc_ffi.so lives in the build tree. Propagate an RPATH (as an
-# INTERFACE option, so it reaches the final fluent-bit binary that links this
-# plugin) pointing at its directory. If you relocate the binary, set
-# LD_LIBRARY_PATH to this directory instead.
-target_link_options(flb-plugin-out_zerobus INTERFACE
-    "-Wl,-rpath,${UC_FFI_TARGET_DIR}/release"
 )

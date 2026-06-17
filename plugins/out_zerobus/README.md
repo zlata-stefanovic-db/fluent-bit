@@ -11,41 +11,42 @@ sink. A schemaless **JSON** mode is also available (`record_format json`).
 
 ## Build
 
-The plugin links two artifacts:
+`CMakeLists.txt` sources the Zerobus SDK (including its C FFI) from a pinned Git
+commit that exposes the dynamic protobuf-schema functions
+(`zerobus_proto_schema_*`). At build time CMake:
 
-1. The prebuilt Zerobus FFI static library. `CMakeLists.txt` expects the SDK
-   checked out at `$HOME/zerobus-sdk`:
-   - header: `$HOME/zerobus-sdk/rust/ffi/zerobus.h`
-   - library: `$HOME/zerobus-sdk/go/lib/linux_amd64/libzerobus_ffi.a`
-   It is linked with `-lresolv -lgcc_s` (in addition to `pthread dl m`) to
-   satisfy the static lib's DNS and stack-unwind symbols — these match the link
-   flags the Zerobus Go SDK uses.
-2. The `zerobus_uc_ffi` companion Rust crate (`zerobus_uc_ffi/`), built
-   automatically by CMake via `cargo`. It depends on the SDK *as a library* (a
-   Cargo path dependency) and exposes the Unity Catalog schema → protobuf
-   descriptor conversion and the per-record protobuf encoder that the C FFI does
-   not. Building it requires:
-   - a Rust toolchain (`cargo` on `PATH` or under `$HOME/.cargo/bin`);
-   - registry access for its dependencies. This box can't reach crates.io
-     directly, so the crate ships a `zerobus_uc_ffi/.cargo/config.toml` that
-     routes through the Databricks internal crates proxy
-     (`crates-proxy.cloud.databricks.com`) — the same mirror as
-     `universe/third_party/rust/config.toml`. Cargo picks it up automatically
-     because CMake runs `cargo` from the crate directory.
-   CMake generates the crate's `Cargo.toml` from `Cargo.toml.in`, substituting
-   the SDK path, then links the resulting `libzerobus_uc_ffi.so` (its directory
-   is added to the binary's RUNPATH, so no `LD_LIBRARY_PATH` is needed).
+1. shallow-fetches the pinned SDK commit (default repo
+   `https://github.com/databricks/zerobus-sdk`, `ZEROBUS_SDK_GIT_REF` pinned to
+   the head of the `ffi-dynamic-protobuf-schema` branch behind PR #371 — bump it
+   to the merge commit on `main` once that lands) into the build tree, and
+2. builds its FFI **static** library (`libzerobus_ffi.a`) from source with
+   `cargo` — the prebuilt `.a` committed in the repo predates these functions,
+   so building from source guarantees the linked library matches the header.
 
-Build as usual; the plugin is enabled by default (`FLB_OUT_ZEROBUS=ON`). Needs
-CMake ≥ 3.20 (a vendored `lib/cfl` requires it). If the system lacks the YAML
-dev headers, add `-DFLB_CONFIG_YAML=Off` (the classic `.conf` format does not
-need them):
+The plugin then links that static library (`+ -lresolv -lgcc_s` alongside
+`pthread dl m`, matching the Zerobus Go SDK's cgo link flags) and calls the SDK
+FFI directly — there is no separate Rust crate.
+
+Build requirements:
+- a Rust toolchain (`cargo` on `PATH` or under `$HOME/.cargo/bin`);
+- **CMake ≥ 3.20** (a vendored `lib/cfl` requires it);
+- registry access for the SDK's Rust dependencies. This box can't reach
+  crates.io directly, so CMake drops a `.cargo/config.toml` into the SDK
+  checkout routing through the Databricks internal crates proxy
+  (`crates-proxy.cloud.databricks.com`, the same mirror as
+  `universe/third_party/rust/config.toml`);
+- `-DFLB_CONFIG_YAML=Off` if the system lacks the YAML dev headers (the classic
+  `.conf` format does not need them).
 
 ```bash
 cmake -B build -DFLB_CONFIG_YAML=Off . && cmake --build build --target fluent-bit-bin
 ```
 
 The resulting binary is `build/bin/fluent-bit`.
+
+To use a different commit/branch/tag or repo, or an existing local checkout
+(skipping the fetch), pass `-DZEROBUS_SDK_GIT_URL=…`,
+`-DZEROBUS_SDK_GIT_REF=<sha|branch|tag>`, or `-DZEROBUS_SDK_DIR=/path/to/checkout`.
 
 ## Configuration
 
@@ -129,7 +130,8 @@ so it must match the workspace that issues the token.
   is required.
 - **Protobuf vs JSON.** Protobuf is the default and mirrors the Vector sink:
   the schema is fetched once at init and reused to encode every record. The
-  descriptor generation and per-record encoding live in the `zerobus_uc_ffi`
-  companion crate (reusing the SDK's `schema::descriptor_from_uc_schema` plus a
-  `prost_reflect` dynamic message). Set `record_format json` to bypass the schema
-  fetch entirely and stream schemaless JSON instead.
+  descriptor generation and per-record encoding are done by the Zerobus SDK FFI
+  (`zerobus_proto_schema_from_uc_json` / `zerobus_proto_schema_encode_json`,
+  reusing the SDK's `schema::descriptor_from_uc_schema` plus a `prost_reflect`
+  dynamic message). Set `record_format json` to bypass the schema fetch entirely
+  and stream schemaless JSON instead.

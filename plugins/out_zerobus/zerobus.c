@@ -34,9 +34,10 @@
 
 /*
  * Fetch the Delta table schema from Unity Catalog and build the protobuf
- * descriptor handle (stored in ctx->uc_schema). On success, *desc_bytes /
- * *desc_len point at the serialized DescriptorProto owned by the handle (valid
- * until the handle is freed) - pass these to zerobus_sdk_create_stream().
+ * descriptor handle (stored in ctx->proto_schema) via the Zerobus SDK FFI. On
+ * success, *desc_bytes / *desc_len point at the serialized DescriptorProto owned
+ * by the handle (valid until the handle is freed) - pass these straight to
+ * zerobus_sdk_create_stream().
  */
 static int build_protobuf_schema(struct flb_output_instance *ins,
                                  struct flb_config *config,
@@ -48,7 +49,8 @@ static int build_protobuf_schema(struct flb_output_instance *ins,
 {
     int ret;
     flb_sds_t schema_json = NULL;
-    char *err = NULL;
+    struct CResult result = {0};
+    uintptr_t len = 0;
 
     ret = uc_fetch_table_schema_json(ins, config,
                                      ctx->unity_catalog_endpoint,
@@ -59,17 +61,25 @@ static int build_protobuf_schema(struct flb_output_instance *ins,
         return -1;
     }
 
-    ret = zb_uc_schema_from_table_json(schema_json, &ctx->uc_schema,
-                                       desc_bytes, desc_len, &err);
+    ctx->proto_schema = zerobus_proto_schema_from_uc_json(schema_json, &result);
     flb_sds_destroy(schema_json);
-    if (ret != 0) {
+    if (!ctx->proto_schema) {
         flb_plg_error(ins, "failed to build protobuf descriptor: %s",
-                      err ? err : "unknown error");
-        if (err) {
-            zb_uc_free_err(err);
+                      result.error_message ? result.error_message : "unknown error");
+        if (result.error_message) {
+            zerobus_free_error_message(result.error_message);
         }
         return -1;
     }
+
+    *desc_bytes = zerobus_proto_schema_descriptor_bytes(ctx->proto_schema, &len);
+    if (!*desc_bytes || len == 0) {
+        flb_plg_error(ins, "Zerobus returned an empty protobuf descriptor");
+        zerobus_proto_schema_free(ctx->proto_schema);
+        ctx->proto_schema = NULL;
+        return -1;
+    }
+    *desc_len = (size_t) len;
 
     flb_plg_info(ins,
                  "built protobuf descriptor from Unity Catalog schema (%zu bytes)",
@@ -263,9 +273,9 @@ static int cb_zerobus_init(struct flb_output_instance *ins,
             if (stream_result.error_message) {
                 zerobus_free_error_message(stream_result.error_message);
             }
-            if (ctx->uc_schema) {
-                zb_uc_schema_free(ctx->uc_schema);
-                ctx->uc_schema = NULL;
+            if (ctx->proto_schema) {
+                zerobus_proto_schema_free(ctx->proto_schema);
+                ctx->proto_schema = NULL;
             }
             zerobus_sdk_free(ctx->zerobus_sdk);
             flb_free(ctx);
@@ -412,13 +422,14 @@ static void cb_zerobus_flush(struct flb_event_chunk *event_chunk,
 
         for (int i = 0; i < record_count; i++) {
             uint8_t *pb = NULL;
-            size_t pl = 0;
-            char *err = NULL;
+            uintptr_t pl = 0;
+            struct CResult enc_result = {0};
 
-            if (zb_uc_encode_json(ctx->uc_schema, json_records[i],
-                                  &pb, &pl, &err) == 0) {
+            if (zerobus_proto_schema_encode_json(ctx->proto_schema,
+                                                 json_records[i],
+                                                 &pb, &pl, &enc_result)) {
                 proto_records[encoded] = pb;
-                proto_lens[encoded] = pl;
+                proto_lens[encoded] = (size_t) pl;
                 encoded++;
             }
             else {
@@ -428,9 +439,10 @@ static void cb_zerobus_flush(struct flb_event_chunk *event_chunk,
                  * (and retrying) the whole chunk forever.
                  */
                 flb_plg_warn(ctx->ins, "skipping record %d: %s", i,
-                             err ? err : "protobuf encode failed");
-                if (err) {
-                    zb_uc_free_err(err);
+                             enc_result.error_message ?
+                             enc_result.error_message : "protobuf encode failed");
+                if (enc_result.error_message) {
+                    zerobus_free_error_message(enc_result.error_message);
                 }
             }
         }
@@ -460,7 +472,7 @@ static void cb_zerobus_flush(struct flb_event_chunk *event_chunk,
         record_count = encoded;
 
         for (int i = 0; i < encoded; i++) {
-            zb_uc_free_bytes(proto_records[i], proto_lens[i]);
+            zerobus_free_proto_bytes(proto_records[i], proto_lens[i]);
         }
         flb_free(proto_records);
         flb_free(proto_lens);
@@ -528,9 +540,9 @@ static int cb_zerobus_exit(void *data, struct flb_config *config)
         zerobus_sdk_free(ctx->zerobus_sdk);
     }
 
-    /* Free the protobuf schema handle (owns the descriptor + message descriptor) */
-    if (ctx->uc_schema) {
-        zb_uc_schema_free(ctx->uc_schema);
+    /* Free the protobuf schema handle (owns the descriptor + encoder) */
+    if (ctx->proto_schema) {
+        zerobus_proto_schema_free(ctx->proto_schema);
     }
 
     /*

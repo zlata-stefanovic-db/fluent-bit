@@ -24,11 +24,9 @@
 #include <fluent-bit/flb_oauth2.h>
 #include <fluent-bit/flb_upstream.h>
 
-/* Include Zerobus Rust SDK FFI header */
+/* Include Zerobus Rust SDK FFI header (also declares the protobuf-schema
+ * helpers: CZerobusProtoSchema + zerobus_proto_schema_*). */
 #include "zerobus.h"
-
-/* Companion FFI: Unity Catalog schema -> protobuf descriptor + record encoder */
-#include "zerobus_uc_ffi.h"
 
 #define FLB_ZEROBUS_DEFAULT_ENDPOINT "https://zerobus.example.com"
 
@@ -61,12 +59,13 @@ struct flb_zerobus_context {
     int use_protobuf;            /* derived from record_format */
 
     /*
-     * Protobuf schema handle. Owns the serialized DescriptorProto handed to the
-     * SDK at stream creation and the message descriptor used to encode each
-     * record. NULL in JSON mode. Built from the Unity Catalog schema in
-     * cb_zerobus_init via the companion FFI crate.
+     * Protobuf schema handle (owned by the Zerobus SDK FFI). Holds the
+     * serialized DescriptorProto handed to the SDK at stream creation and the
+     * encoder used to turn each record into protobuf bytes. NULL in JSON mode.
+     * Built from the Unity Catalog schema in cb_zerobus_init via
+     * zerobus_proto_schema_from_uc_json().
      */
-    struct ZbUcSchema *uc_schema;
+    struct CZerobusProtoSchema *proto_schema;
 
     /* Plugin instance */
     struct flb_output_instance *ins;
