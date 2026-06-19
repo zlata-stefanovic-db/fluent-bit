@@ -68,7 +68,8 @@ To use a different commit/branch/tag or repo, or an existing local checkout
 | `recovery_retries` | no | Number of recovery attempts. SDK default if unset. |
 | `server_lack_of_ack_timeout_ms` | no | Wait for a server ack before erroring (ms). SDK default if unset. |
 | `flush_timeout_ms` | no | Stream flush timeout (ms). SDK default if unset. |
-| `oauth2.enable` | yes | Set `true` to authenticate (required by Zerobus). |
+| `max_batch_bytes` | no | Maximum payload bytes per SDK ingest call. Default `10000000` (10MB hard limit). |
+| `oauth2.enable` | yes | Must be `true` (required by Zerobus). |
 | `oauth2.client_id` | yes | Service-principal client ID. Also used to fetch the Unity Catalog schema in protobuf mode. |
 | `oauth2.client_secret` | yes | Service-principal client secret. |
 | `oauth2.token_url` | no | Parsed but **not used** — the SDK derives the token endpoint from `unity_catalog_endpoint`. |
@@ -140,6 +141,17 @@ so it must match the workspace that issues the token.
   recovers/rotates the underlying stream on its own worker threads, so per-flush
   ingestion only enqueues records and stays shallow — no coroutine-stack tuning
   is required.
+- **Flush-level ack confirmation.** A flush may issue multiple ingest calls
+  (for example, when splitting by `max_batch_bytes`) and then waits once on the
+  final returned offset (`wait_for_offset`) before the chunk is marked
+  `FLB_OK`. This keeps Zerobus pipelining active while still requiring server
+  acceptance before Fluent Bit acks the chunk.
+- **Retryable failures reuse the stream.** On retryable ingest/ack errors the
+  plugin returns `FLB_RETRY` and leaves the stream in place; the SDK's recovery
+  task reconnects it on its own worker threads (see the `recovery*` options).
+  The stream is created once at init and freed only at shutdown — flush never
+  tears it down or rebuilds it, so the synchronous TLS handshake never runs on
+  the shallow flush-coroutine stack.
 - **Protobuf vs JSON.** Protobuf is the default and matches the Vector
   `databricks_zerobus` sink's row-level protobuf ingestion: the schema is fetched
   once at init and reused to encode every record. The descriptor generation and

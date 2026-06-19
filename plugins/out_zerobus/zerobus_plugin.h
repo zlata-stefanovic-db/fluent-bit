@@ -78,6 +78,7 @@ struct flb_zerobus_context {
     int recovery_retries;
     int server_lack_of_ack_timeout_ms;
     int flush_timeout_ms;
+    int max_batch_bytes;
 
     /*
      * Protobuf schema handle (owned by the Zerobus SDK FFI). Holds the

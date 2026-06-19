@@ -34,6 +34,57 @@
 #include "zerobus_plugin.h"
 #include "unity_catalog.h"
 
+#define FLB_ZEROBUS_MAX_BATCH_BYTES_LIMIT 10000000
+
+static int table_name_is_valid(const char *table_name)
+{
+    const char *p;
+    const char *segment_start;
+    int dot_count;
+
+    if (!table_name || table_name[0] == '\0') {
+        return FLB_FALSE;
+    }
+
+    dot_count = 0;
+    segment_start = table_name;
+    p = table_name;
+
+    while (*p != '\0') {
+        if (*p == '.') {
+            if (p == segment_start) {
+                return FLB_FALSE;
+            }
+            dot_count++;
+            segment_start = p + 1;
+        }
+        p++;
+    }
+
+    if (p == segment_start) {
+        return FLB_FALSE;
+    }
+
+    return dot_count == 2 ? FLB_TRUE : FLB_FALSE;
+}
+
+static void close_and_free_stream(struct flb_zerobus_context *ctx)
+{
+    struct CResult close_result = {0};
+
+    if (!ctx->zerobus_stream) {
+        return;
+    }
+
+    zerobus_stream_close(ctx->zerobus_stream, &close_result);
+    if (close_result.error_message) {
+        zerobus_free_error_message(close_result.error_message);
+    }
+
+    zerobus_stream_free(ctx->zerobus_stream);
+    ctx->zerobus_stream = NULL;
+}
+
 /*
  * Fetch the Delta table schema from Unity Catalog and build the protobuf
  * descriptor handle (stored in ctx->proto_schema) via the Zerobus SDK FFI. On
@@ -86,6 +137,103 @@ static int build_protobuf_schema(struct flb_output_instance *ins,
     flb_plg_info(ins,
                  "built protobuf descriptor from Unity Catalog schema (%zu bytes)",
                  *desc_len);
+    return 0;
+}
+
+static int create_zerobus_stream(struct flb_output_instance *ins,
+                                 struct flb_config *config,
+                                 struct flb_zerobus_context *ctx)
+{
+    char *client_id;
+    char *client_secret;
+    const uint8_t *descriptor;
+    size_t descriptor_len;
+    struct CResult stream_result = {0};
+    struct CStreamConfigurationOptions options = zerobus_get_default_config();
+
+    client_id = ctx->oauth2_config.client_id;
+    client_secret = ctx->oauth2_config.client_secret;
+    descriptor = NULL;
+    descriptor_len = 0;
+
+    /*
+     * Override SDK stream defaults only where the user set an option. Each
+     * tuning knob defaults to -1 ("unset"), so the SDK's own default is
+     * preserved unless explicitly configured.
+     */
+    if (ctx->max_inflight_requests >= 0) {
+        options.max_inflight_requests = (uintptr_t) ctx->max_inflight_requests;
+    }
+    if (ctx->recovery >= 0) {
+        options.recovery = ctx->recovery ? true : false;
+    }
+    if (ctx->recovery_timeout_ms >= 0) {
+        options.recovery_timeout_ms = (uint64_t) ctx->recovery_timeout_ms;
+    }
+    if (ctx->recovery_backoff_ms >= 0) {
+        options.recovery_backoff_ms = (uint64_t) ctx->recovery_backoff_ms;
+    }
+    if (ctx->recovery_retries >= 0) {
+        options.recovery_retries = (uint32_t) ctx->recovery_retries;
+    }
+    if (ctx->server_lack_of_ack_timeout_ms >= 0) {
+        options.server_lack_of_ack_timeout_ms =
+            (uint64_t) ctx->server_lack_of_ack_timeout_ms;
+    }
+    if (ctx->flush_timeout_ms >= 0) {
+        options.flush_timeout_ms = (uint64_t) ctx->flush_timeout_ms;
+    }
+
+    if (ctx->use_protobuf) {
+        if (!ctx->proto_schema) {
+            if (build_protobuf_schema(ins, config, ctx,
+                                      client_id, client_secret,
+                                      &descriptor, &descriptor_len) != 0) {
+                return -1;
+            }
+        }
+        else {
+            uintptr_t len = 0;
+            descriptor = zerobus_proto_schema_descriptor_bytes(ctx->proto_schema, &len);
+            if (!descriptor || len == 0) {
+                flb_plg_error(ins, "protobuf descriptor unavailable from schema handle");
+                return -1;
+            }
+            descriptor_len = (size_t) len;
+        }
+
+        options.record_type = FLB_ZEROBUS_RECORD_TYPE_PROTO;
+        flb_plg_info(ins, "creating Zerobus stream for table: %s (protobuf mode)",
+                     ctx->table_name);
+    }
+    else {
+        options.record_type = FLB_ZEROBUS_RECORD_TYPE_JSON;
+        flb_plg_info(ins, "creating Zerobus stream for table: %s (JSON mode)",
+                     ctx->table_name);
+    }
+
+    ctx->zerobus_stream = zerobus_sdk_create_stream(
+        ctx->zerobus_sdk,
+        ctx->table_name,
+        descriptor,      /* NULL in JSON mode */
+        descriptor_len,  /* 0 in JSON mode */
+        client_id,
+        client_secret,
+        &options,
+        &stream_result
+    );
+
+    if (!stream_result.success || !ctx->zerobus_stream) {
+        flb_plg_error(ins, "failed to create Zerobus stream: %s",
+                      stream_result.error_message ?
+                      stream_result.error_message : "unknown error");
+        if (stream_result.error_message) {
+            zerobus_free_error_message(stream_result.error_message);
+        }
+        return -1;
+    }
+
+    flb_plg_info(ins, "Zerobus stream created successfully");
     return 0;
 }
 
@@ -145,7 +293,13 @@ static int cb_zerobus_init(struct flb_output_instance *ins,
     }
 
     if (!ctx->table_name) {
-        flb_plg_error(ins, "table_name is required (format: catalog.schema.table)");
+        flb_plg_error(ins, "table_name is required");
+        flb_free(ctx);
+        return -1;
+    }
+    if (table_name_is_valid(ctx->table_name) != FLB_TRUE) {
+        flb_plg_error(ins, "table_name must be in format catalog.schema.table "
+                      "(exactly three non-empty parts)");
         flb_free(ctx);
         return -1;
     }
@@ -173,8 +327,13 @@ static int cb_zerobus_init(struct flb_output_instance *ins,
     if (ctx->record_format && strcasecmp(ctx->record_format, "json") == 0) {
         ctx->use_protobuf = FLB_FALSE;
     }
-    else {
+    else if (ctx->record_format && strcasecmp(ctx->record_format, "protobuf") == 0) {
         ctx->use_protobuf = FLB_TRUE;
+    }
+    else {
+        flb_plg_error(ins, "record_format must be either 'protobuf' or 'json'");
+        flb_free(ctx);
+        return -1;
     }
 
     /*
@@ -184,25 +343,25 @@ static int cb_zerobus_init(struct flb_output_instance *ins,
      * Unity Catalog URL). We therefore do not stand up an flb_oauth2 runtime
      * context; we just make sure the credentials are present.
      */
-    if (ctx->oauth2_config.enabled == FLB_TRUE) {
-        if (!ctx->oauth2_config.client_id || !ctx->oauth2_config.client_secret) {
-            flb_plg_error(ins,
-                          "oauth2 requires oauth2.client_id and oauth2.client_secret");
-            flb_free(ctx);
-            return -1;
-        }
-        flb_plg_info(ins, "OAuth2 client-credentials authentication enabled");
+    if (ctx->oauth2_config.enabled != FLB_TRUE) {
+        flb_plg_error(ins, "oauth2.enable must be true");
+        flb_free(ctx);
+        return -1;
     }
-    /*
-     * The client credentials are consumed only when oauth2.enable is true. If a
-     * user supplied them but left oauth2.enable unset, authentication (and, in
-     * protobuf mode, the Unity Catalog schema fetch) would silently run without
-     * credentials, so flag it here rather than failing with a confusing
-     * "missing credentials" error later.
-     */
-    else if (ctx->oauth2_config.client_id || ctx->oauth2_config.client_secret) {
-        flb_plg_warn(ins, "oauth2.client_id/secret are set but oauth2.enable is "
-                     "not true; set 'oauth2.enable true' to use them");
+    if (!ctx->oauth2_config.client_id || !ctx->oauth2_config.client_secret) {
+        flb_plg_error(ins,
+                      "oauth2 requires oauth2.client_id and oauth2.client_secret");
+        flb_free(ctx);
+        return -1;
+    }
+    flb_plg_info(ins, "OAuth2 client-credentials authentication enabled");
+
+    if (ctx->max_batch_bytes <= 0 ||
+        ctx->max_batch_bytes > FLB_ZEROBUS_MAX_BATCH_BYTES_LIMIT) {
+        flb_plg_error(ins, "max_batch_bytes must be between 1 and %d",
+                      FLB_ZEROBUS_MAX_BATCH_BYTES_LIMIT);
+        flb_free(ctx);
+        return -1;
     }
 
     /* Initialize Zerobus SDK */
@@ -238,118 +397,14 @@ static int cb_zerobus_init(struct flb_output_instance *ins,
 
     flb_plg_info(ins, "Zerobus SDK initialized successfully");
 
-    /*
-     * Create the stream here, on the main thread, rather than lazily on the
-     * first flush. Stream creation runs a synchronous TLS handshake + OAuth2
-     * exchange that needs a large stack; the main thread has one, whereas the
-     * flush coroutine's stack is tiny (~24 KiB) and would overflow. Once the
-     * stream exists, the SDK's supervisor task handles all reconnects/rotations
-     * on its own worker threads, so per-flush ingestion stays shallow.
-     */
-    {
-        char *client_id = NULL;
-        char *client_secret = NULL;
-        const uint8_t *descriptor = NULL;
-        size_t descriptor_len = 0;
-        struct CResult stream_result = {0};
-        struct CStreamConfigurationOptions options = zerobus_get_default_config();
-
-        /*
-         * Override SDK stream defaults only where the user set an option. Each
-         * tuning knob defaults to -1 ("unset"), so the SDK's own default is
-         * preserved unless explicitly configured.
-         */
-        if (ctx->max_inflight_requests >= 0) {
-            options.max_inflight_requests = (uintptr_t) ctx->max_inflight_requests;
+    if (create_zerobus_stream(ins, config, ctx) != 0) {
+        if (ctx->proto_schema) {
+            zerobus_proto_schema_free(ctx->proto_schema);
+            ctx->proto_schema = NULL;
         }
-        if (ctx->recovery >= 0) {
-            options.recovery = ctx->recovery ? true : false;
-        }
-        if (ctx->recovery_timeout_ms >= 0) {
-            options.recovery_timeout_ms = (uint64_t) ctx->recovery_timeout_ms;
-        }
-        if (ctx->recovery_backoff_ms >= 0) {
-            options.recovery_backoff_ms = (uint64_t) ctx->recovery_backoff_ms;
-        }
-        if (ctx->recovery_retries >= 0) {
-            options.recovery_retries = (uint32_t) ctx->recovery_retries;
-        }
-        if (ctx->server_lack_of_ack_timeout_ms >= 0) {
-            options.server_lack_of_ack_timeout_ms =
-                (uint64_t) ctx->server_lack_of_ack_timeout_ms;
-        }
-        if (ctx->flush_timeout_ms >= 0) {
-            options.flush_timeout_ms = (uint64_t) ctx->flush_timeout_ms;
-        }
-
-        if (ctx->oauth2_config.enabled == FLB_TRUE) {
-            client_id = ctx->oauth2_config.client_id;
-            client_secret = ctx->oauth2_config.client_secret;
-        }
-
-        if (ctx->use_protobuf) {
-            /*
-             * Protobuf mode: fetch the table schema from Unity Catalog and build
-             * the descriptor. This needs the service-principal credentials (for
-             * the UC OAuth2 exchange), the same ones the SDK uses for the stream.
-             */
-            if (!client_id || !client_secret) {
-                flb_plg_error(ins, "protobuf mode requires oauth2 credentials to "
-                              "fetch the Unity Catalog schema: set 'oauth2.enable "
-                              "true' together with oauth2.client_id and "
-                              "oauth2.client_secret (or use record_format json)");
-                zerobus_sdk_free(ctx->zerobus_sdk);
-                flb_free(ctx);
-                return -1;
-            }
-
-            if (build_protobuf_schema(ins, config, ctx,
-                                      client_id, client_secret,
-                                      &descriptor, &descriptor_len) != 0) {
-                zerobus_sdk_free(ctx->zerobus_sdk);
-                flb_free(ctx);
-                return -1;
-            }
-
-            options.record_type = FLB_ZEROBUS_RECORD_TYPE_PROTO;
-            flb_plg_info(ins, "creating Zerobus stream for table: %s (protobuf mode)",
-                         ctx->table_name);
-        }
-        else {
-            /* JSON mode: no protobuf descriptor needed */
-            options.record_type = FLB_ZEROBUS_RECORD_TYPE_JSON;
-            flb_plg_info(ins, "creating Zerobus stream for table: %s (JSON mode)",
-                         ctx->table_name);
-        }
-
-        ctx->zerobus_stream = zerobus_sdk_create_stream(
-            ctx->zerobus_sdk,
-            ctx->table_name,
-            descriptor,      /* NULL in JSON mode */
-            descriptor_len,  /* 0 in JSON mode */
-            client_id,
-            client_secret,
-            &options,
-            &stream_result
-        );
-
-        if (!stream_result.success || !ctx->zerobus_stream) {
-            flb_plg_error(ins, "failed to create Zerobus stream: %s",
-                          stream_result.error_message ?
-                          stream_result.error_message : "unknown error");
-            if (stream_result.error_message) {
-                zerobus_free_error_message(stream_result.error_message);
-            }
-            if (ctx->proto_schema) {
-                zerobus_proto_schema_free(ctx->proto_schema);
-                ctx->proto_schema = NULL;
-            }
-            zerobus_sdk_free(ctx->zerobus_sdk);
-            flb_free(ctx);
-            return -1;
-        }
-
-        flb_plg_info(ins, "Zerobus stream created successfully");
+        zerobus_sdk_free(ctx->zerobus_sdk);
+        flb_free(ctx);
+        return -1;
     }
 
     flb_plg_info(ins, "initialized: ingestion_endpoint=%s unity_catalog_endpoint=%s table_name=%s",
@@ -415,12 +470,23 @@ static void cb_zerobus_flush(struct flb_event_chunk *event_chunk,
     struct flb_log_event log_event;
     int ret;
     int total_records;
-    int record_count = 0;
-    char **json_records = NULL;
+    int record_count;
+    int flush_status;
+    char **json_records;
+    struct CResult ingest_result;
+    struct CResult wait_result;
     int64_t last_offset;
+    int start;
+    int end;
+    size_t batch_bytes;
     (void) i_ins;
-    (void) config;
     (void) out_flush;
+    (void) config;
+
+    record_count = 0;
+    flush_status = FLB_OK;
+    json_records = NULL;
+    last_offset = -1;
 
     /* Only handle log events for now */
     if (event_chunk->type != FLB_EVENT_TYPE_LOGS) {
@@ -432,12 +498,15 @@ static void cb_zerobus_flush(struct flb_event_chunk *event_chunk,
                   event_chunk->size);
 
     /*
-     * The stream is created in cb_zerobus_init (on the main thread, which has a
-     * large enough stack for the TLS handshake) and the SDK recovers it
-     * automatically thereafter, so it should always be present here.
+     * The stream is created once in cb_zerobus_init and reused for the life of
+     * the plugin; the SDK recovers/reconnects it in place on its own worker
+     * threads (the recovery* options). Flush never rebuilds it - doing so would
+     * run the SDK's synchronous TLS handshake on the shallow flush coroutine
+     * stack. This guard should never fire; if it ever does, retry rather than
+     * dereference a NULL stream.
      */
     if (!ctx->zerobus_stream) {
-        flb_plg_error(ctx->ins, "no Zerobus stream available");
+        flb_plg_error(ctx->ins, "no active Zerobus stream; cannot flush");
         FLB_OUTPUT_RETURN(FLB_RETRY);
     }
 
@@ -475,20 +544,22 @@ static void cb_zerobus_flush(struct flb_event_chunk *event_chunk,
     }
 
     /* Convert each record to JSON (record_count tracks how many we filled) */
-    record_count = 0;
-
     while (record_count < total_records &&
            (ret = flb_log_event_decoder_next(&log_decoder, &log_event))
            == FLB_EVENT_DECODER_SUCCESS) {
-        
+        char *json_str;
+
         /* Convert MessagePack body to JSON string */
-        char *json_str = flb_msgpack_to_json_str(4096, log_event.body, FLB_FALSE);
-        
+        json_str = flb_msgpack_to_json_str(4096, log_event.body, FLB_FALSE);
+
         if (!json_str) {
+            int i;
+
             flb_plg_error(ctx->ins, "failed to convert log event to JSON");
-            /* Cleanup on error */
-            for (int i = 0; i < record_count; i++) {
-                if (json_records[i]) flb_free(json_records[i]);
+            for (i = 0; i < record_count; i++) {
+                if (json_records[i]) {
+                    flb_free(json_records[i]);
+                }
             }
             flb_free(json_records);
             flb_log_event_decoder_destroy(&log_decoder);
@@ -517,9 +588,9 @@ static void cb_zerobus_flush(struct flb_event_chunk *event_chunk,
     }
 
     flb_log_event_decoder_destroy(&log_decoder);
-
-    /* Ingest the batch via the Zerobus SDK */
-    struct CResult ingest_result = {0};
+    ingest_result.success = false;
+    ingest_result.error_message = NULL;
+    ingest_result.is_retryable = false;
 
     if (ctx->use_protobuf) {
         /*
@@ -528,11 +599,15 @@ static void cb_zerobus_flush(struct flb_event_chunk *event_chunk,
          */
         uint8_t **proto_records;
         size_t *proto_lens;
-        int encoded = 0;
+        int encoded;
+        int i;
 
+        encoded = 0;
         proto_records = flb_calloc(record_count, sizeof(uint8_t *));
         proto_lens = flb_calloc(record_count, sizeof(size_t));
         if (!proto_records || !proto_lens) {
+            int j;
+
             flb_plg_error(ctx->ins, "failed to allocate protobuf record arrays");
             if (proto_records) {
                 flb_free(proto_records);
@@ -540,19 +615,25 @@ static void cb_zerobus_flush(struct flb_event_chunk *event_chunk,
             if (proto_lens) {
                 flb_free(proto_lens);
             }
-            for (int i = 0; i < record_count; i++) {
-                if (json_records[i]) {
-                    flb_free(json_records[i]);
+            for (j = 0; j < record_count; j++) {
+                if (json_records[j]) {
+                    flb_free(json_records[j]);
                 }
             }
             flb_free(json_records);
             FLB_OUTPUT_RETURN(FLB_RETRY);
         }
 
-        for (int i = 0; i < record_count; i++) {
-            uint8_t *pb = NULL;
-            uintptr_t pl = 0;
-            struct CResult enc_result = {0};
+        for (i = 0; i < record_count; i++) {
+            uint8_t *pb;
+            uintptr_t pl;
+            struct CResult enc_result;
+
+            pb = NULL;
+            pl = 0;
+            enc_result.success = false;
+            enc_result.error_message = NULL;
+            enc_result.is_retryable = false;
 
             if (zerobus_proto_schema_encode_json(ctx->proto_schema,
                                                  json_records[i],
@@ -577,7 +658,7 @@ static void cb_zerobus_flush(struct flb_event_chunk *event_chunk,
         }
 
         /* JSON strings are no longer needed once encoded */
-        for (int i = 0; i < record_count; i++) {
+        for (i = 0; i < record_count; i++) {
             if (json_records[i]) {
                 flb_free(json_records[i]);
             }
@@ -602,30 +683,203 @@ static void cb_zerobus_flush(struct flb_event_chunk *event_chunk,
             FLB_OUTPUT_RETURN(FLB_ERROR);
         }
 
-        last_offset = zerobus_stream_ingest_proto_records(
-            ctx->zerobus_stream,
-            (const uint8_t *const *) proto_records,
-            (const uintptr_t *) proto_lens,
-            encoded,
-            &ingest_result
-        );
-        record_count = encoded;
+        for (start = 0; start < encoded; start = end) {
+            end = start;
+            batch_bytes = 0;
 
-        for (int i = 0; i < encoded; i++) {
+            while (end < encoded) {
+                if (proto_lens[end] > (size_t) ctx->max_batch_bytes) {
+                    flb_plg_error(ctx->ins,
+                                  "record %d encoded to %zu bytes, exceeding max_batch_bytes=%d",
+                                  end, proto_lens[end], ctx->max_batch_bytes);
+                    flush_status = FLB_ERROR;
+                    break;
+                }
+
+                if (batch_bytes > 0 &&
+                    batch_bytes + proto_lens[end] > (size_t) ctx->max_batch_bytes) {
+                    break;
+                }
+
+                batch_bytes += proto_lens[end];
+                end++;
+            }
+
+            if (flush_status == FLB_ERROR) {
+                break;
+            }
+
+            ingest_result.success = false;
+            ingest_result.error_message = NULL;
+            ingest_result.is_retryable = false;
+            last_offset = zerobus_stream_ingest_proto_records(
+                ctx->zerobus_stream,
+                (const uint8_t *const *) (proto_records + start),
+                (const uintptr_t *) (proto_lens + start),
+                (uintptr_t) (end - start),
+                &ingest_result
+            );
+
+            if (!ingest_result.success) {
+                flb_plg_error(ctx->ins, "failed to ingest records: %s",
+                              ingest_result.error_message ?
+                              ingest_result.error_message : "unknown error");
+                if (ingest_result.error_message) {
+                    zerobus_free_error_message(ingest_result.error_message);
+                }
+                if (ingest_result.is_retryable) {
+                    flush_status = FLB_RETRY;
+                }
+                else {
+                    flush_status = FLB_ERROR;
+                }
+                break;
+            }
+
+        }
+
+        if (flush_status == FLB_OK) {
+            if (last_offset < 0) {
+                flb_plg_error(ctx->ins, "ingest succeeded but returned invalid "
+                              "offset (%ld); cannot confirm server ack",
+                              (long) last_offset);
+                flush_status = FLB_ERROR;
+            }
+            else {
+                wait_result.success = false;
+                wait_result.error_message = NULL;
+                wait_result.is_retryable = false;
+                if (!zerobus_stream_wait_for_offset(ctx->zerobus_stream,
+                                                    last_offset, &wait_result)) {
+                    flb_plg_error(ctx->ins, "failed waiting for ack at offset %ld: %s",
+                                  (long) last_offset,
+                                  wait_result.error_message ?
+                                  wait_result.error_message : "unknown error");
+                    if (wait_result.error_message) {
+                        zerobus_free_error_message(wait_result.error_message);
+                    }
+                    if (wait_result.is_retryable) {
+                        flush_status = FLB_RETRY;
+                    }
+                    else {
+                        flush_status = FLB_ERROR;
+                    }
+                }
+            }
+        }
+
+        record_count = encoded;
+        for (i = 0; i < encoded; i++) {
             zerobus_free_proto_bytes(proto_records[i], proto_lens[i]);
         }
         flb_free(proto_records);
         flb_free(proto_lens);
     }
     else {
-        last_offset = zerobus_stream_ingest_json_records(
-            ctx->zerobus_stream,
-            (const char *const *) json_records,
-            record_count,
-            &ingest_result
-        );
+        int i;
+        size_t *json_lens;
 
-        for (int i = 0; i < record_count; i++) {
+        json_lens = flb_calloc(record_count, sizeof(size_t));
+        if (!json_lens) {
+            for (i = 0; i < record_count; i++) {
+                if (json_records[i]) {
+                    flb_free(json_records[i]);
+                }
+            }
+            flb_free(json_records);
+            FLB_OUTPUT_RETURN(FLB_RETRY);
+        }
+
+        for (i = 0; i < record_count; i++) {
+            json_lens[i] = strlen(json_records[i]);
+        }
+
+        for (start = 0; start < record_count; start = end) {
+            end = start;
+            batch_bytes = 0;
+
+            while (end < record_count) {
+                if (json_lens[end] > (size_t) ctx->max_batch_bytes) {
+                    flb_plg_error(ctx->ins,
+                                  "record %d JSON size %zu exceeds max_batch_bytes=%d",
+                                  end, json_lens[end], ctx->max_batch_bytes);
+                    flush_status = FLB_ERROR;
+                    break;
+                }
+
+                if (batch_bytes > 0 &&
+                    batch_bytes + json_lens[end] > (size_t) ctx->max_batch_bytes) {
+                    break;
+                }
+
+                batch_bytes += json_lens[end];
+                end++;
+            }
+
+            if (flush_status == FLB_ERROR) {
+                break;
+            }
+
+            ingest_result.success = false;
+            ingest_result.error_message = NULL;
+            ingest_result.is_retryable = false;
+            last_offset = zerobus_stream_ingest_json_records(
+                ctx->zerobus_stream,
+                (const char *const *) (json_records + start),
+                (uintptr_t) (end - start),
+                &ingest_result
+            );
+
+            if (!ingest_result.success) {
+                flb_plg_error(ctx->ins, "failed to ingest records: %s",
+                              ingest_result.error_message ?
+                              ingest_result.error_message : "unknown error");
+                if (ingest_result.error_message) {
+                    zerobus_free_error_message(ingest_result.error_message);
+                }
+                if (ingest_result.is_retryable) {
+                    flush_status = FLB_RETRY;
+                }
+                else {
+                    flush_status = FLB_ERROR;
+                }
+                break;
+            }
+
+        }
+
+        if (flush_status == FLB_OK) {
+            if (last_offset < 0) {
+                flb_plg_error(ctx->ins, "ingest succeeded but returned invalid "
+                              "offset (%ld); cannot confirm server ack",
+                              (long) last_offset);
+                flush_status = FLB_ERROR;
+            }
+            else {
+                wait_result.success = false;
+                wait_result.error_message = NULL;
+                wait_result.is_retryable = false;
+                if (!zerobus_stream_wait_for_offset(ctx->zerobus_stream,
+                                                    last_offset, &wait_result)) {
+                    flb_plg_error(ctx->ins, "failed waiting for ack at offset %ld: %s",
+                                  (long) last_offset,
+                                  wait_result.error_message ?
+                                  wait_result.error_message : "unknown error");
+                    if (wait_result.error_message) {
+                        zerobus_free_error_message(wait_result.error_message);
+                    }
+                    if (wait_result.is_retryable) {
+                        flush_status = FLB_RETRY;
+                    }
+                    else {
+                        flush_status = FLB_ERROR;
+                    }
+                }
+            }
+        }
+
+        flb_free(json_lens);
+        for (i = 0; i < record_count; i++) {
             if (json_records[i]) {
                 flb_free(json_records[i]);
             }
@@ -633,25 +887,13 @@ static void cb_zerobus_flush(struct flb_event_chunk *event_chunk,
         flb_free(json_records);
     }
 
-    /* Check ingestion result */
-    if (!ingest_result.success) {
-        flb_plg_error(ctx->ins, "failed to ingest records: %s",
-                      ingest_result.error_message ?
-                      ingest_result.error_message : "unknown error");
-        
-        if (ingest_result.error_message) {
-            zerobus_free_error_message(ingest_result.error_message);
-        }
-
-        /* Return RETRY if retryable, ERROR otherwise */
-        if (ingest_result.is_retryable) {
-            flb_plg_warn(ctx->ins, "ingestion failed but is retryable");
-            FLB_OUTPUT_RETURN(FLB_RETRY);
-        }
-        else {
-            flb_plg_error(ctx->ins, "ingestion failed with non-retryable error");
-            FLB_OUTPUT_RETURN(FLB_ERROR);
-        }
+    if (flush_status == FLB_RETRY) {
+        flb_plg_warn(ctx->ins, "retryable Zerobus failure; chunk marked for "
+                     "retry (SDK recovers the stream in place)");
+        FLB_OUTPUT_RETURN(FLB_RETRY);
+    }
+    if (flush_status == FLB_ERROR) {
+        FLB_OUTPUT_RETURN(FLB_ERROR);
     }
 
     flb_plg_debug(ctx->ins, "successfully ingested %d records, last_offset=%ld",
@@ -670,14 +912,7 @@ static int cb_zerobus_exit(void *data, struct flb_config *config)
     }
 
     /* Cleanup Zerobus SDK resources */
-    if (ctx->zerobus_stream) {
-        struct CResult result = {0};
-        zerobus_stream_close(ctx->zerobus_stream, &result);
-        if (result.error_message) {
-            zerobus_free_error_message(result.error_message);
-        }
-        zerobus_stream_free(ctx->zerobus_stream);
-    }
+    close_and_free_stream(ctx);
 
     if (ctx->zerobus_sdk) {
         zerobus_sdk_free(ctx->zerobus_sdk);
@@ -770,6 +1005,11 @@ static struct flb_config_map config_map[] = {
      FLB_CONFIG_MAP_INT, "flush_timeout_ms", "-1",
      0, FLB_TRUE, offsetof(struct flb_zerobus_context, flush_timeout_ms),
      "Stream flush timeout in milliseconds (SDK default if unset)"
+    },
+    {
+     FLB_CONFIG_MAP_INT, "max_batch_bytes", "10000000",
+     0, FLB_TRUE, offsetof(struct flb_zerobus_context, max_batch_bytes),
+     "Maximum payload bytes per SDK ingest call (must be <= 10000000)"
     },
 
     /* EOF */
