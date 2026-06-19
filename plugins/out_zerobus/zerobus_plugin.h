@@ -28,8 +28,6 @@
  * helpers: CZerobusProtoSchema + zerobus_proto_schema_*). */
 #include "zerobus.h"
 
-#define FLB_ZEROBUS_DEFAULT_ENDPOINT "https://zerobus.example.com"
-
 /* Zerobus RecordType enum values (from Go SDK types.go) */
 #define FLB_ZEROBUS_RECORD_TYPE_UNSPECIFIED 0
 #define FLB_ZEROBUS_RECORD_TYPE_PROTO       1
@@ -52,11 +50,34 @@ struct flb_zerobus_context {
     /*
      * Record format: "protobuf" (default) fetches the table schema from Unity
      * Catalog, derives a protobuf descriptor, and ingests protobuf-encoded
-     * records (the Vector sink's approach). "json" ingests JSON records and
-     * needs no descriptor.
+     * records. "json" ingests JSON records and needs no descriptor.
      */
     flb_sds_t record_format;
     int use_protobuf;            /* derived from record_format */
+
+    /*
+     * Optional column name under which the Fluent Bit event timestamp is
+     * injected into each record before encoding. NULL (default) means the
+     * event time is not propagated: only the record body is sent, so a
+     * timestamp column is populated only if the body already carries it or the
+     * table has a server-side default. When set, the event time is written as
+     * an int64 of microseconds since the Unix epoch (the encoding a Delta
+     * TIMESTAMP / TIMESTAMP_NTZ column expects).
+     */
+    flb_sds_t time_key;
+
+    /*
+     * Optional Zerobus stream tuning. Each is -1 ("unset") by default, which
+     * leaves the SDK's own default in place; a value >= 0 overrides the
+     * corresponding field of CStreamConfigurationOptions at stream creation.
+     */
+    int max_inflight_requests;
+    int recovery;                       /* tristate: -1 keep, 0 off, 1 on */
+    int recovery_timeout_ms;
+    int recovery_backoff_ms;
+    int recovery_retries;
+    int server_lack_of_ack_timeout_ms;
+    int flush_timeout_ms;
 
     /*
      * Protobuf schema handle (owned by the Zerobus SDK FFI). Holds the

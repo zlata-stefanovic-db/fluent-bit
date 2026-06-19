@@ -6,8 +6,12 @@ handles the gRPC streaming, OAuth2 token exchange, TLS, and recovery internally.
 
 By default the plugin ingests **protobuf** records: it fetches the target
 table's schema from Unity Catalog, derives a protobuf descriptor from it, and
-encodes each record to match — the same approach as the Vector `databricks_zerobus`
-sink. A schemaless **JSON** mode is also available (`record_format json`).
+encodes each record to match — the same row-level protobuf ingestion as the
+Vector `databricks_zerobus` sink. A schemaless **JSON** mode is also available
+(`record_format json`).
+
+The Unity Catalog schema is fetched **once at startup**, so a schema change on
+the target table requires restarting Fluent Bit to pick it up.
 
 ## Build
 
@@ -56,6 +60,14 @@ To use a different commit/branch/tag or repo, or an existing local checkout
 | `unity_catalog_endpoint` | yes | Workspace URL; the SDK mints the OAuth token from `<unity_catalog_endpoint>/oidc/v1/token`. |
 | `table_name` | yes | Target table as `catalog.schema.table`. |
 | `record_format` | no | `protobuf` (default) or `json`. Protobuf fetches the table schema from Unity Catalog and ingests protobuf records; JSON ingests schemaless JSON. |
+| `time_key` | no | Column name to populate with the Fluent Bit event timestamp, written as int64 microseconds since the Unix epoch (a Delta `TIMESTAMP`/`TIMESTAMP_NTZ` column). Unset by default: the event time is not propagated, so a timestamp column is filled only from a body field or a table default. |
+| `max_inflight_requests` | no | Max unacknowledged ingest requests in flight. SDK default if unset. |
+| `recovery` | no | Stream recovery: `1` on, `0` off, `-1` (default) keep the SDK default. |
+| `recovery_timeout_ms` | no | Stream recovery timeout (ms). SDK default if unset. |
+| `recovery_backoff_ms` | no | Backoff between recovery attempts (ms). SDK default if unset. |
+| `recovery_retries` | no | Number of recovery attempts. SDK default if unset. |
+| `server_lack_of_ack_timeout_ms` | no | Wait for a server ack before erroring (ms). SDK default if unset. |
+| `flush_timeout_ms` | no | Stream flush timeout (ms). SDK default if unset. |
 | `oauth2.enable` | yes | Set `true` to authenticate (required by Zerobus). |
 | `oauth2.client_id` | yes | Service-principal client ID. Also used to fetch the Unity Catalog schema in protobuf mode. |
 | `oauth2.client_secret` | yes | Service-principal client secret. |
@@ -128,10 +140,21 @@ so it must match the workspace that issues the token.
   recovers/rotates the underlying stream on its own worker threads, so per-flush
   ingestion only enqueues records and stays shallow — no coroutine-stack tuning
   is required.
-- **Protobuf vs JSON.** Protobuf is the default and mirrors the Vector sink:
-  the schema is fetched once at init and reused to encode every record. The
-  descriptor generation and per-record encoding are done by the Zerobus SDK FFI
+- **Protobuf vs JSON.** Protobuf is the default and matches the Vector
+  `databricks_zerobus` sink's row-level protobuf ingestion: the schema is fetched
+  once at init and reused to encode every record. The descriptor generation and
+  per-record encoding are done by the Zerobus SDK FFI
   (`zerobus_proto_schema_from_uc_json` / `zerobus_proto_schema_encode_json`,
   reusing the SDK's `schema::descriptor_from_uc_schema` plus a `prost_reflect`
-  dynamic message). Set `record_format json` to bypass the schema fetch entirely
-  and stream schemaless JSON instead.
+  dynamic message). One mechanical difference from Vector: this plugin converts
+  each record msgpack → JSON string → protobuf because the SDK's C FFI only
+  exposes a JSON encode entry point, whereas Vector encodes protobuf directly
+  from its structured values. Set `record_format json` to bypass the schema fetch
+  entirely and stream schemaless JSON instead.
+- **Workers.** The plugin keeps a single Zerobus stream and protobuf encoder on
+  the output context and uses them directly from the flush callback, which is
+  not safe to call concurrently. Configuring `workers` greater than `1` is
+  therefore rejected at startup; the plugin runs single-threaded (`workers 1`).
+- **Stream tuning.** The `recovery*`, `*_timeout_ms`, and `max_inflight_requests`
+  options map to the SDK's stream configuration. Each is left at the SDK default
+  unless set, so most deployments need none of them.
