@@ -87,6 +87,7 @@ add_custom_target(zerobus_ffi_build DEPENDS "${ZEROBUS_FFI_LIB}")
 
 set(src
     zerobus.c
+    zerobus_util.c
     unity_catalog.c)
 
 FLB_PLUGIN(out_zerobus "${src}" "")

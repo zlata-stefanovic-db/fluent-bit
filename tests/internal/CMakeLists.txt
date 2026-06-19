@@ -66,6 +66,13 @@ if(FLB_OUT_AZURE_BLOB)
     )
 endif()
 
+if(FLB_OUT_ZEROBUS)
+  set(UNIT_TESTS_FILES
+    ${UNIT_TESTS_FILES}
+    zerobus.c
+    )
+endif()
+
 # TLS helpers
 if(FLB_TLS)
   set(UNIT_TESTS_FILES
@@ -277,6 +284,17 @@ if(FLB_METRICS AND FLB_PROCESSOR_CUMULATIVE_TO_DELTA)
     ${CUMULATIVE_TO_DELTA_CORE_SOURCE})
   target_include_directories(flb-it-cumulative_to_delta PRIVATE
     ${CUMULATIVE_TO_DELTA_PLUGIN_DIR})
+endif()
+
+# The zerobus unit test exercises the plugin's FFI-free helpers directly, so it
+# compiles zerobus_util.c in rather than linking the full plugin (which would
+# drag in the Zerobus Rust SDK / gRPC).
+if(FLB_OUT_ZEROBUS)
+  set(ZEROBUS_PLUGIN_DIR ${PROJECT_SOURCE_DIR}/plugins/out_zerobus)
+  target_sources(flb-it-zerobus PRIVATE
+    ${ZEROBUS_PLUGIN_DIR}/zerobus_util.c)
+  target_include_directories(flb-it-zerobus PRIVATE
+    ${ZEROBUS_PLUGIN_DIR})
 endif()
 
 if(FLB_TESTS_INTERNAL_FUZZ)

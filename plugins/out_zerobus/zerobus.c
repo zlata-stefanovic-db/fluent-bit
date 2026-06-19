@@ -33,40 +33,9 @@
 /* Include plugin context header (which includes Zerobus SDK) */
 #include "zerobus_plugin.h"
 #include "unity_catalog.h"
+#include "zerobus_util.h"
 
 #define FLB_ZEROBUS_MAX_BATCH_BYTES_LIMIT 10000000
-
-static int table_name_is_valid(const char *table_name)
-{
-    const char *p;
-    const char *segment_start;
-    int dot_count;
-
-    if (!table_name || table_name[0] == '\0') {
-        return FLB_FALSE;
-    }
-
-    dot_count = 0;
-    segment_start = table_name;
-    p = table_name;
-
-    while (*p != '\0') {
-        if (*p == '.') {
-            if (p == segment_start) {
-                return FLB_FALSE;
-            }
-            dot_count++;
-            segment_start = p + 1;
-        }
-        p++;
-    }
-
-    if (p == segment_start) {
-        return FLB_FALSE;
-    }
-
-    return dot_count == 2 ? FLB_TRUE : FLB_FALSE;
-}
 
 static void close_and_free_stream(struct flb_zerobus_context *ctx)
 {
@@ -368,43 +337,53 @@ static int cb_zerobus_init(struct flb_output_instance *ins,
     ctx->zerobus_sdk = NULL;
     ctx->zerobus_stream = NULL;
 
-    struct CResult sdk_result = {0};
-    {
-        /*
-         * Build via the builder API so we can advertise an SDK identifier; the
-         * SDK folds it into the gRPC User-Agent (helping server-side telemetry
-         * attribute traffic to this plugin). zerobus_sdk_builder_build() frees
-         * the builder on both the success and failure paths, so we never call
-         * zerobus_sdk_builder_free() here.
-         */
-        struct CZerobusSdkBuilder *sdk_builder = zerobus_sdk_builder_new();
-        zerobus_sdk_builder_endpoint(sdk_builder, ctx->ingestion_endpoint);
-        zerobus_sdk_builder_unity_catalog_url(sdk_builder,
-                                              ctx->unity_catalog_endpoint);
-        zerobus_sdk_builder_sdk_identifier(sdk_builder, "fluent-bit-out_zerobus");
-        ctx->zerobus_sdk = zerobus_sdk_builder_build(sdk_builder, &sdk_result);
-    }
-
-    if (!sdk_result.success) {
-        flb_plg_error(ins, "failed to initialize Zerobus SDK: %s",
-                      sdk_result.error_message ? sdk_result.error_message : "unknown error");
-        if (sdk_result.error_message) {
-            zerobus_free_error_message(sdk_result.error_message);
+    /*
+     * In formatter test mode the engine never calls cb_flush; it invokes the
+     * test formatter against ctx directly (see cb_zerobus_format_test). Skip the
+     * SDK init and the synchronous stream handshake so record-shaping tests run
+     * without a live Zerobus endpoint. Mirrors out_chronicle's test_mode guard.
+     * This branch is never taken outside the runtime test harness.
+     */
+    if (ins->test_mode == FLB_FALSE) {
+        struct CResult sdk_result = {0};
+        {
+            /*
+             * Build via the builder API so we can advertise an SDK identifier; the
+             * SDK folds it into the gRPC User-Agent (helping server-side telemetry
+             * attribute traffic to this plugin). zerobus_sdk_builder_build() frees
+             * the builder on both the success and failure paths, so we never call
+             * zerobus_sdk_builder_free() here.
+             */
+            struct CZerobusSdkBuilder *sdk_builder = zerobus_sdk_builder_new();
+            zerobus_sdk_builder_endpoint(sdk_builder, ctx->ingestion_endpoint);
+            zerobus_sdk_builder_unity_catalog_url(sdk_builder,
+                                                  ctx->unity_catalog_endpoint);
+            zerobus_sdk_builder_sdk_identifier(sdk_builder,
+                                               "fluent-bit-out_zerobus");
+            ctx->zerobus_sdk = zerobus_sdk_builder_build(sdk_builder, &sdk_result);
         }
-        flb_free(ctx);
-        return -1;
-    }
 
-    flb_plg_info(ins, "Zerobus SDK initialized successfully");
-
-    if (create_zerobus_stream(ins, config, ctx) != 0) {
-        if (ctx->proto_schema) {
-            zerobus_proto_schema_free(ctx->proto_schema);
-            ctx->proto_schema = NULL;
+        if (!sdk_result.success) {
+            flb_plg_error(ins, "failed to initialize Zerobus SDK: %s",
+                          sdk_result.error_message ? sdk_result.error_message : "unknown error");
+            if (sdk_result.error_message) {
+                zerobus_free_error_message(sdk_result.error_message);
+            }
+            flb_free(ctx);
+            return -1;
         }
-        zerobus_sdk_free(ctx->zerobus_sdk);
-        flb_free(ctx);
-        return -1;
+
+        flb_plg_info(ins, "Zerobus SDK initialized successfully");
+
+        if (create_zerobus_stream(ins, config, ctx) != 0) {
+            if (ctx->proto_schema) {
+                zerobus_proto_schema_free(ctx->proto_schema);
+                ctx->proto_schema = NULL;
+            }
+            zerobus_sdk_free(ctx->zerobus_sdk);
+            flb_free(ctx);
+            return -1;
+        }
     }
 
     flb_plg_info(ins, "initialized: ingestion_endpoint=%s unity_catalog_endpoint=%s table_name=%s",
@@ -415,48 +394,101 @@ static int cb_zerobus_init(struct flb_output_instance *ins,
 }
 
 /*
- * Return a newly allocated JSON object string equal to body_json but with an
- * extra integer member "<time_key>": <micros> spliced in as the first field.
- * body_json must be a JSON object ("{...}") as produced by
- * flb_msgpack_to_json_str(). The result is a plain heap string (freed with
- * flb_free, like the body strings it replaces). Returns NULL if body_json is
- * not an object or on allocation failure, in which case the caller keeps the
- * original (un-timestamped) body rather than dropping the record.
+ * Convert one decoded log event body to a JSON object string, splicing the
+ * event timestamp under `time_key` when configured (int64 microseconds). Returns
+ * a heap string (free with flb_free) or NULL if the body could not be
+ * serialized. Shared by the flush path and the test formatter so both produce
+ * byte-identical record JSON.
  */
-static char *json_with_time_key(const char *body_json, const char *time_key,
-                                int64_t micros)
+static char *record_body_to_json(struct flb_log_event *log_event,
+                                 const char *time_key)
 {
-    int n;
-    size_t cap;
-    char *out;
-    size_t blen = strlen(body_json);
+    char *json_str;
 
-    if (blen < 2 || body_json[0] != '{') {
+    json_str = flb_msgpack_to_json_str(4096, log_event->body, FLB_FALSE);
+    if (!json_str) {
         return NULL;
     }
 
-    /* "{\"<time_key>\":<micros>" + ("}" | "," + body members) + NUL */
-    cap = blen + strlen(time_key) + 32;
-    out = flb_malloc(cap);
+    if (time_key) {
+        int64_t micros =
+            (int64_t) (flb_time_to_nanosec(&log_event->timestamp) / 1000);
+        char *with_ts = json_with_time_key(json_str, time_key, micros);
+        if (with_ts) {
+            flb_free(json_str);
+            json_str = with_ts;
+        }
+    }
+
+    return json_str;
+}
+
+/*
+ * Test-only formatter (registered via .test_formatter.callback). Decodes the
+ * chunk and emits the per-record JSON - exactly as the flush path builds it,
+ * including the spliced time_key - as a JSON array. This lets runtime tests
+ * assert the record shaping without opening a Zerobus stream. It is never called
+ * on the production flush path; it shares record_body_to_json() with it so the
+ * assertion covers the real conversion logic.
+ */
+static int cb_zerobus_format_test(struct flb_config *config,
+                                  struct flb_input_instance *ins,
+                                  void *plugin_context,
+                                  void *flush_ctx,
+                                  int event_type,
+                                  const char *tag, int tag_len,
+                                  const void *data, size_t bytes,
+                                  void **out_data, size_t *out_size)
+{
+    struct flb_zerobus_context *ctx = plugin_context;
+    struct flb_log_event_decoder log_decoder;
+    struct flb_log_event log_event;
+    flb_sds_t out;
+    int count;
+    int ret;
+
+    (void) config;
+    (void) ins;
+    (void) flush_ctx;
+    (void) event_type;
+    (void) tag;
+    (void) tag_len;
+
+    ret = flb_log_event_decoder_init(&log_decoder, (char *) data, bytes);
+    if (ret != FLB_EVENT_DECODER_SUCCESS) {
+        return -1;
+    }
+
+    out = flb_sds_create_size(bytes + 64);
     if (!out) {
-        return NULL;
+        flb_log_event_decoder_destroy(&log_decoder);
+        return -1;
     }
 
-    if (blen == 2) {
-        /* body is "{}" — the timestamp is the only member */
-        n = snprintf(out, cap, "{\"%s\":%" PRId64 "}", time_key, micros);
+    count = 0;
+    flb_sds_cat_safe(&out, "[", 1);
+    while (flb_log_event_decoder_next(&log_decoder, &log_event)
+           == FLB_EVENT_DECODER_SUCCESS) {
+        char *json_str = record_body_to_json(&log_event, ctx->time_key);
+        if (!json_str) {
+            flb_sds_destroy(out);
+            flb_log_event_decoder_destroy(&log_decoder);
+            return -1;
+        }
+        if (count > 0) {
+            flb_sds_cat_safe(&out, ",", 1);
+        }
+        flb_sds_cat_safe(&out, json_str, (int) strlen(json_str));
+        flb_free(json_str);
+        count++;
     }
-    else {
-        /* body is "{<members>}" — replace its leading '{' with ',' */
-        n = snprintf(out, cap, "{\"%s\":%" PRId64 ",%s",
-                     time_key, micros, body_json + 1);
-    }
+    flb_sds_cat_safe(&out, "]", 1);
 
-    if (n < 0 || (size_t) n >= cap) {
-        flb_free(out);
-        return NULL;
-    }
-    return out;
+    flb_log_event_decoder_destroy(&log_decoder);
+
+    *out_data = out;
+    *out_size = flb_sds_len(out);
+    return 0;
 }
 
 static void cb_zerobus_flush(struct flb_event_chunk *event_chunk,
@@ -478,7 +510,6 @@ static void cb_zerobus_flush(struct flb_event_chunk *event_chunk,
     int64_t last_offset;
     int start;
     int end;
-    size_t batch_bytes;
     (void) i_ins;
     (void) out_flush;
     (void) config;
@@ -549,8 +580,12 @@ static void cb_zerobus_flush(struct flb_event_chunk *event_chunk,
            == FLB_EVENT_DECODER_SUCCESS) {
         char *json_str;
 
-        /* Convert MessagePack body to JSON string */
-        json_str = flb_msgpack_to_json_str(4096, log_event.body, FLB_FALSE);
+        /*
+         * Convert the MessagePack body to a JSON string, splicing the event
+         * timestamp under time_key when configured. On failure we keep the
+         * original body rather than drop the record (handled inside the helper).
+         */
+        json_str = record_body_to_json(&log_event, ctx->time_key);
 
         if (!json_str) {
             int i;
@@ -564,23 +599,6 @@ static void cb_zerobus_flush(struct flb_event_chunk *event_chunk,
             flb_free(json_records);
             flb_log_event_decoder_destroy(&log_decoder);
             FLB_OUTPUT_RETURN(FLB_RETRY);
-        }
-
-        /*
-         * Splice the Fluent Bit event timestamp into the record under the
-         * configured key. The body itself does not carry the event time, so
-         * without this a timestamp column can only be filled from a body field
-         * or a server-side default. On failure we keep the original body rather
-         * than drop the record.
-         */
-        if (ctx->time_key) {
-            int64_t micros =
-                (int64_t) (flb_time_to_nanosec(&log_event.timestamp) / 1000);
-            char *with_ts = json_with_time_key(json_str, ctx->time_key, micros);
-            if (with_ts) {
-                flb_free(json_str);
-                json_str = with_ts;
-            }
         }
 
         json_records[record_count] = json_str;
@@ -684,28 +702,17 @@ static void cb_zerobus_flush(struct flb_event_chunk *event_chunk,
         }
 
         for (start = 0; start < encoded; start = end) {
-            end = start;
-            batch_bytes = 0;
+            int oversized_idx;
 
-            while (end < encoded) {
-                if (proto_lens[end] > (size_t) ctx->max_batch_bytes) {
-                    flb_plg_error(ctx->ins,
-                                  "record %d encoded to %zu bytes, exceeding max_batch_bytes=%d",
-                                  end, proto_lens[end], ctx->max_batch_bytes);
-                    flush_status = FLB_ERROR;
-                    break;
-                }
-
-                if (batch_bytes > 0 &&
-                    batch_bytes + proto_lens[end] > (size_t) ctx->max_batch_bytes) {
-                    break;
-                }
-
-                batch_bytes += proto_lens[end];
-                end++;
-            }
-
-            if (flush_status == FLB_ERROR) {
+            end = zerobus_next_batch_end(proto_lens, encoded, start,
+                                         (size_t) ctx->max_batch_bytes,
+                                         &oversized_idx);
+            if (oversized_idx >= 0) {
+                flb_plg_error(ctx->ins,
+                              "record %d encoded to %zu bytes, exceeding max_batch_bytes=%d",
+                              oversized_idx, proto_lens[oversized_idx],
+                              ctx->max_batch_bytes);
+                flush_status = FLB_ERROR;
                 break;
             }
 
@@ -795,28 +802,17 @@ static void cb_zerobus_flush(struct flb_event_chunk *event_chunk,
         }
 
         for (start = 0; start < record_count; start = end) {
-            end = start;
-            batch_bytes = 0;
+            int oversized_idx;
 
-            while (end < record_count) {
-                if (json_lens[end] > (size_t) ctx->max_batch_bytes) {
-                    flb_plg_error(ctx->ins,
-                                  "record %d JSON size %zu exceeds max_batch_bytes=%d",
-                                  end, json_lens[end], ctx->max_batch_bytes);
-                    flush_status = FLB_ERROR;
-                    break;
-                }
-
-                if (batch_bytes > 0 &&
-                    batch_bytes + json_lens[end] > (size_t) ctx->max_batch_bytes) {
-                    break;
-                }
-
-                batch_bytes += json_lens[end];
-                end++;
-            }
-
-            if (flush_status == FLB_ERROR) {
+            end = zerobus_next_batch_end(json_lens, record_count, start,
+                                         (size_t) ctx->max_batch_bytes,
+                                         &oversized_idx);
+            if (oversized_idx >= 0) {
+                flb_plg_error(ctx->ins,
+                              "record %d JSON size %zu exceeds max_batch_bytes=%d",
+                              oversized_idx, json_lens[oversized_idx],
+                              ctx->max_batch_bytes);
+                flush_status = FLB_ERROR;
                 break;
             }
 
@@ -1023,5 +1019,6 @@ struct flb_output_plugin out_zerobus_plugin = {
     .cb_flush     = cb_zerobus_flush,
     .cb_exit      = cb_zerobus_exit,
     .config_map   = config_map,
+    .test_formatter.callback = cb_zerobus_format_test,
     .flags        = 0,
 };
