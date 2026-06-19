@@ -28,7 +28,7 @@
  * helpers: CZerobusProtoSchema + zerobus_proto_schema_*). */
 #include "zerobus.h"
 
-/* Zerobus RecordType enum values (from Go SDK types.go) */
+/* Zerobus RecordType enum values, as expected by the SDK stream configuration. */
 #define FLB_ZEROBUS_RECORD_TYPE_UNSPECIFIED 0
 #define FLB_ZEROBUS_RECORD_TYPE_PROTO       1
 #define FLB_ZEROBUS_RECORD_TYPE_JSON        2

@@ -10,7 +10,6 @@ void flb_test_zerobus_oauth_disabled(void);
 void flb_test_zerobus_missing_oauth_secret(void);
 void flb_test_zerobus_invalid_max_batch_bytes_too_large(void);
 void flb_test_zerobus_invalid_max_batch_bytes_zero(void);
-void flb_test_zerobus_workers_gt_one(void);
 void flb_test_zerobus_format_with_time_key(void);
 void flb_test_zerobus_format_without_time_key(void);
 
@@ -22,7 +21,6 @@ TEST_LIST = {
     {"missing_oauth_secret", flb_test_zerobus_missing_oauth_secret},
     {"max_batch_bytes_too_large", flb_test_zerobus_invalid_max_batch_bytes_too_large},
     {"max_batch_bytes_zero", flb_test_zerobus_invalid_max_batch_bytes_zero},
-    {"workers_gt_one", flb_test_zerobus_workers_gt_one},
     {"format_with_time_key", flb_test_zerobus_format_with_time_key},
     {"format_without_time_key", flb_test_zerobus_format_without_time_key},
     {NULL, NULL}
@@ -294,27 +292,6 @@ void flb_test_zerobus_invalid_max_batch_bytes_zero(void)
         return;
     }
     flb_output_set(ctx, out_ffd, "max_batch_bytes", "0", NULL);
-
-    expect_start_failure(ctx);
-}
-
-void flb_test_zerobus_workers_gt_one(void)
-{
-    int out_ffd;
-    flb_ctx_t *ctx;
-
-    ctx = zerobus_test_ctx_create();
-    TEST_CHECK(ctx != NULL);
-    if (!ctx) {
-        return;
-    }
-
-    out_ffd = zerobus_output_configure_base(ctx);
-    if (!TEST_CHECK(out_ffd >= 0)) {
-        flb_destroy(ctx);
-        return;
-    }
-    flb_output_set(ctx, out_ffd, "workers", "2", NULL);
 
     expect_start_failure(ctx);
 }

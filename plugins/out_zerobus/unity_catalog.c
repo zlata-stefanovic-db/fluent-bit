@@ -82,8 +82,7 @@ static flb_sds_t uc_get_bearer(struct flb_output_instance *ins,
 
     /*
      * Databricks accepts the client credentials in the request body for the
-     * client-credentials grant (this matches the Vector sink). scope=all-apis
-     * requests a workspace-wide token.
+     * client-credentials grant. scope=all-apis requests a workspace-wide token.
      */
     flb_oauth2_payload_clear(o);
     if (flb_oauth2_payload_append(o, "grant_type", -1, "client_credentials", -1) < 0 ||

@@ -27,7 +27,7 @@
  * Fetch a Delta table's schema from the Unity Catalog REST API and return the
  * raw JSON response body.
  *
- * Mirrors the Vector sink's two-call flow:
+ * The schema is fetched in two calls:
  *   1. POST {uc_endpoint}/oidc/v1/token  (OAuth2 client-credentials grant)
  *   2. GET  {uc_endpoint}/api/2.1/unity-catalog/tables/{table}
  *           with "Authorization: Bearer <token>"

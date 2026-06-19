@@ -101,9 +101,8 @@ target_include_directories(flb-plugin-out_zerobus PRIVATE
 )
 
 # Link the Zerobus SDK FFI static library and the system libraries its Rust code
-# needs. These match the link flags the Zerobus Go SDK uses for linux on its cgo
-# directive (libzerobus_ffi.a -ldl -lpthread -lm -lresolv -lgcc_s); resolv and
-# gcc_s resolve the static lib's DNS and stack-unwind symbols.
+# needs (-ldl -lpthread -lm -lresolv -lgcc_s): resolv and gcc_s resolve the
+# static lib's DNS and stack-unwind symbols respectively.
 target_link_libraries(flb-plugin-out_zerobus
     ${ZEROBUS_FFI_LIB}
     pthread

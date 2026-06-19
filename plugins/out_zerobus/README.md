@@ -6,8 +6,7 @@ handles the gRPC streaming, OAuth2 token exchange, TLS, and recovery internally.
 
 By default the plugin ingests **protobuf** records: it fetches the target
 table's schema from Unity Catalog, derives a protobuf descriptor from it, and
-encodes each record to match — the same row-level protobuf ingestion as the
-Vector `databricks_zerobus` sink. A schemaless **JSON** mode is also available
+encodes each record to match. A schemaless **JSON** mode is also available
 (`record_format json`).
 
 The Unity Catalog schema is fetched **once at startup**, so a schema change on
@@ -27,16 +26,16 @@ commit that exposes the dynamic protobuf-schema functions
    `cargo` — the prebuilt `.a` committed in the repo predates these functions,
    so building from source guarantees the linked library matches the header.
 
-The plugin then links that static library (`+ -lresolv -lgcc_s` alongside
-`pthread dl m`, matching the Zerobus Go SDK's cgo link flags) and calls the SDK
-FFI directly — there is no separate Rust crate.
+The plugin then links that static library (`-lresolv -lgcc_s` alongside
+`pthread dl m`, required by the SDK FFI's transitive dependencies) and calls the
+SDK FFI directly — there is no separate Rust crate.
 
 Build requirements:
 - a Rust toolchain (`cargo` on `PATH` or under `$HOME/.cargo/bin`);
 - **CMake ≥ 3.20** (a vendored `lib/cfl` requires it);
-- registry access for the SDK's Rust dependencies. This box can't reach
-  crates.io directly, so CMake drops a `.cargo/config.toml` into the SDK
-  checkout routing through the Databricks internal crates proxy
+- registry access for the SDK's Rust dependencies. When the build environment
+  cannot reach crates.io directly, CMake writes a `.cargo/config.toml` into the
+  SDK checkout routing through the Databricks internal crates proxy
   (`crates-proxy.cloud.databricks.com`, the same mirror as
   `universe/third_party/rust/config.toml`);
 - `-DFLB_CONFIG_YAML=Off` if the system lacks the YAML dev headers (the classic
@@ -133,14 +132,15 @@ so it must match the workspace that issues the token.
 
 ## Notes
 
-- **Stream is created at init.** The SDK runs a synchronous TLS handshake +
-  OAuth2 exchange when the stream is created, which needs a large stack. The
-  plugin does this in `cb_init` on the main thread (which has one), so a bad
-  endpoint or bad credentials fail startup with a clear error rather than
-  retrying on first flush. After that, the SDK's supervisor task transparently
-  recovers/rotates the underlying stream on its own worker threads, so per-flush
-  ingestion only enqueues records and stays shallow — no coroutine-stack tuning
-  is required.
+- **Streams are created off the flush path.** The SDK runs a synchronous TLS
+  handshake + OAuth2 exchange when a stream is created, which needs a large
+  stack. The plugin creates streams in `cb_init` (the single-stream default) or
+  in per-worker init (`workers > 0`) — both run on a thread with a deep stack —
+  so a bad endpoint or bad credentials fail startup with a clear error rather
+  than on first flush. Afterward the SDK's supervisor task transparently recovers
+  and rotates the underlying stream on its own worker threads, so per-flush
+  ingestion only enqueues records and stays shallow; no coroutine-stack tuning is
+  required.
 - **Flush-level ack confirmation.** A flush may issue multiple ingest calls
   (for example, when splitting by `max_batch_bytes`) and then waits once on the
   final returned offset (`wait_for_offset`) before the chunk is marked
@@ -149,24 +149,26 @@ so it must match the workspace that issues the token.
 - **Retryable failures reuse the stream.** On retryable ingest/ack errors the
   plugin returns `FLB_RETRY` and leaves the stream in place; the SDK's recovery
   task reconnects it on its own worker threads (see the `recovery*` options).
-  The stream is created once at init and freed only at shutdown — flush never
-  tears it down or rebuilds it, so the synchronous TLS handshake never runs on
-  the shallow flush-coroutine stack.
-- **Protobuf vs JSON.** Protobuf is the default and matches the Vector
-  `databricks_zerobus` sink's row-level protobuf ingestion: the schema is fetched
-  once at init and reused to encode every record. The descriptor generation and
-  per-record encoding are done by the Zerobus SDK FFI
-  (`zerobus_proto_schema_from_uc_json` / `zerobus_proto_schema_encode_json`,
-  reusing the SDK's `schema::descriptor_from_uc_schema` plus a `prost_reflect`
-  dynamic message). One mechanical difference from Vector: this plugin converts
-  each record msgpack → JSON string → protobuf because the SDK's C FFI only
-  exposes a JSON encode entry point, whereas Vector encodes protobuf directly
-  from its structured values. Set `record_format json` to bypass the schema fetch
-  entirely and stream schemaless JSON instead.
-- **Workers.** The plugin keeps a single Zerobus stream and protobuf encoder on
-  the output context and uses them directly from the flush callback, which is
-  not safe to call concurrently. Configuring `workers` greater than `1` is
-  therefore rejected at startup; the plugin runs single-threaded (`workers 1`).
+  Streams are created at init (or per-worker init) and freed only at shutdown —
+  flush never tears one down or rebuilds it, so the synchronous TLS handshake
+  never runs on the shallow flush-coroutine stack.
+- **Protobuf vs JSON.** Protobuf is the default: the table schema is fetched once
+  at init and reused to encode every record. Descriptor generation and per-record
+  encoding are performed by the Zerobus SDK FFI
+  (`zerobus_proto_schema_from_uc_json` and `zerobus_proto_schema_encode_json`,
+  which build a `prost_reflect` dynamic message from the descriptor). Each record
+  is converted msgpack → JSON string → protobuf, because the SDK's C FFI exposes a
+  JSON encode entry point rather than accepting structured values directly. Set
+  `record_format json` to bypass the schema fetch entirely and stream schemaless
+  JSON instead.
+- **Workers / multiple streams.** Each flush blocks until Zerobus acks the batch
+  (so `FLB_OK` means the rows were durably accepted), which makes a single stream
+  ack-latency bound. To parallelize, set `workers N`: each worker thread opens
+  its **own** Zerobus stream (a stream carries per-connection state and is not
+  thread-safe), while the SDK object and the protobuf encoder are shared (both are
+  immutable/thread-safe). `workers 0`/unset keeps the original single-stream
+  behavior. Streams are always created off the flush coroutine — in worker init or
+  plugin init — because the SDK's synchronous TLS handshake needs a deep stack.
 - **Stream tuning.** The `recovery*`, `*_timeout_ms`, and `max_inflight_requests`
   options map to the SDK's stream configuration. Each is left at the SDK default
   unless set, so most deployments need none of them.

@@ -25,6 +25,7 @@
 #include <fluent-bit/flb_config_map.h>
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_mp.h>
+#include <fluent-bit/flb_thread_storage.h>
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
@@ -37,21 +38,45 @@
 
 #define FLB_ZEROBUS_MAX_BATCH_BYTES_LIMIT 10000000
 
-static void close_and_free_stream(struct flb_zerobus_context *ctx)
+/*
+ * Per-worker Zerobus stream. A stream carries mutable per-connection state
+ * (offsets, the gRPC channel) and is NOT safe to share across threads, so with
+ * workers > 1 each worker thread owns its own stream, kept in thread-local
+ * storage and created in cb_zerobus_worker_init. The SDK object and the
+ * protobuf encoder (ctx->proto_schema) ARE safe to share and stay on the
+ * context. With workers == 0 there is no worker thread, so the single stream
+ * lives on ctx->zerobus_stream instead (created in cb_zerobus_init).
+ */
+FLB_TLS_DEFINE(struct CZerobusStream, zerobus_worker_stream);
+
+static void close_and_free_stream(struct CZerobusStream *stream)
 {
     struct CResult close_result = {0};
 
-    if (!ctx->zerobus_stream) {
+    if (!stream) {
         return;
     }
 
-    zerobus_stream_close(ctx->zerobus_stream, &close_result);
+    zerobus_stream_close(stream, &close_result);
     if (close_result.error_message) {
         zerobus_free_error_message(close_result.error_message);
     }
 
-    zerobus_stream_free(ctx->zerobus_stream);
-    ctx->zerobus_stream = NULL;
+    zerobus_stream_free(stream);
+}
+
+/*
+ * The stream this flush should use: the calling worker's own stream when
+ * running with workers > 1, otherwise the single shared stream on the context.
+ */
+static struct CZerobusStream *zerobus_active_stream(struct flb_zerobus_context *ctx)
+{
+    struct CZerobusStream *stream = FLB_TLS_GET(zerobus_worker_stream);
+
+    if (stream) {
+        return stream;
+    }
+    return ctx->zerobus_stream;
 }
 
 /*
@@ -109,17 +134,27 @@ static int build_protobuf_schema(struct flb_output_instance *ins,
     return 0;
 }
 
-static int create_zerobus_stream(struct flb_output_instance *ins,
-                                 struct flb_config *config,
-                                 struct flb_zerobus_context *ctx)
+/*
+ * Open one Zerobus stream and return it (NULL on failure). The protobuf encoder
+ * (ctx->proto_schema) must already be built by cb_zerobus_init - this function
+ * only reads its descriptor bytes, so it is safe to call concurrently from
+ * multiple worker threads. Each call performs a synchronous TLS handshake, which
+ * is why it runs on a worker thread's (or the main thread's) deep stack, never
+ * on a flush coroutine.
+ */
+static struct CZerobusStream *create_zerobus_stream(struct flb_output_instance *ins,
+                                                    struct flb_config *config,
+                                                    struct flb_zerobus_context *ctx)
 {
     char *client_id;
     char *client_secret;
     const uint8_t *descriptor;
     size_t descriptor_len;
+    struct CZerobusStream *stream;
     struct CResult stream_result = {0};
     struct CStreamConfigurationOptions options = zerobus_get_default_config();
 
+    (void) config;
     client_id = ctx->oauth2_config.client_id;
     client_secret = ctx->oauth2_config.client_secret;
     descriptor = NULL;
@@ -154,22 +189,18 @@ static int create_zerobus_stream(struct flb_output_instance *ins,
     }
 
     if (ctx->use_protobuf) {
+        uintptr_t len = 0;
+
         if (!ctx->proto_schema) {
-            if (build_protobuf_schema(ins, config, ctx,
-                                      client_id, client_secret,
-                                      &descriptor, &descriptor_len) != 0) {
-                return -1;
-            }
+            flb_plg_error(ins, "protobuf schema not initialized before stream creation");
+            return NULL;
         }
-        else {
-            uintptr_t len = 0;
-            descriptor = zerobus_proto_schema_descriptor_bytes(ctx->proto_schema, &len);
-            if (!descriptor || len == 0) {
-                flb_plg_error(ins, "protobuf descriptor unavailable from schema handle");
-                return -1;
-            }
-            descriptor_len = (size_t) len;
+        descriptor = zerobus_proto_schema_descriptor_bytes(ctx->proto_schema, &len);
+        if (!descriptor || len == 0) {
+            flb_plg_error(ins, "protobuf descriptor unavailable from schema handle");
+            return NULL;
         }
+        descriptor_len = (size_t) len;
 
         options.record_type = FLB_ZEROBUS_RECORD_TYPE_PROTO;
         flb_plg_info(ins, "creating Zerobus stream for table: %s (protobuf mode)",
@@ -181,7 +212,7 @@ static int create_zerobus_stream(struct flb_output_instance *ins,
                      ctx->table_name);
     }
 
-    ctx->zerobus_stream = zerobus_sdk_create_stream(
+    stream = zerobus_sdk_create_stream(
         ctx->zerobus_sdk,
         ctx->table_name,
         descriptor,      /* NULL in JSON mode */
@@ -192,18 +223,18 @@ static int create_zerobus_stream(struct flb_output_instance *ins,
         &stream_result
     );
 
-    if (!stream_result.success || !ctx->zerobus_stream) {
+    if (!stream_result.success || !stream) {
         flb_plg_error(ins, "failed to create Zerobus stream: %s",
                       stream_result.error_message ?
                       stream_result.error_message : "unknown error");
         if (stream_result.error_message) {
             zerobus_free_error_message(stream_result.error_message);
         }
-        return -1;
+        return NULL;
     }
 
     flb_plg_info(ins, "Zerobus stream created successfully");
-    return 0;
+    return stream;
 }
 
 static int cb_zerobus_init(struct flb_output_instance *ins,
@@ -274,21 +305,6 @@ static int cb_zerobus_init(struct flb_output_instance *ins,
     }
 
     /*
-     * The plugin keeps one Zerobus stream and one protobuf encoder on the
-     * shared context and uses them directly from cb_zerobus_flush. With more
-     * than one worker, flushes run on multiple threads and would call into the
-     * same stream/encoder concurrently, which they are not safe for. Reject the
-     * configuration rather than corrupt state at runtime.
-     */
-    if (ins->tp_workers > 1) {
-        flb_plg_error(ins, "workers must be 1: the plugin shares a single "
-                      "Zerobus stream and encoder across flushes (got workers=%d)",
-                      ins->tp_workers);
-        flb_free(ctx);
-        return -1;
-    }
-
-    /*
      * Record format. Default is protobuf: fetch the table schema from Unity
      * Catalog and ingest protobuf-encoded records. "json" keeps the schemaless
      * JSON ingestion path.
@@ -337,6 +353,9 @@ static int cb_zerobus_init(struct flb_output_instance *ins,
     ctx->zerobus_sdk = NULL;
     ctx->zerobus_stream = NULL;
 
+    /* Set up the thread-local slot that holds each worker's own stream. */
+    FLB_TLS_INIT(zerobus_worker_stream);
+
     /*
      * In formatter test mode the engine never calls cb_flush; it invokes the
      * test formatter against ctx directly (see cb_zerobus_format_test). Skip the
@@ -375,21 +394,98 @@ static int cb_zerobus_init(struct flb_output_instance *ins,
 
         flb_plg_info(ins, "Zerobus SDK initialized successfully");
 
-        if (create_zerobus_stream(ins, config, ctx) != 0) {
-            if (ctx->proto_schema) {
-                zerobus_proto_schema_free(ctx->proto_schema);
-                ctx->proto_schema = NULL;
+        /*
+         * Build the protobuf encoder once here (it fetches the Unity Catalog
+         * schema over the network). It is immutable and thread-safe, so every
+         * worker stream shares it; building it now also keeps the per-worker
+         * cb_zerobus_worker_init off the network for the schema.
+         */
+        if (ctx->use_protobuf) {
+            const uint8_t *desc_bytes = NULL;
+            size_t desc_len = 0;
+
+            if (build_protobuf_schema(ins, config, ctx,
+                                      ctx->oauth2_config.client_id,
+                                      ctx->oauth2_config.client_secret,
+                                      &desc_bytes, &desc_len) != 0) {
+                zerobus_sdk_free(ctx->zerobus_sdk);
+                flb_free(ctx);
+                return -1;
             }
-            zerobus_sdk_free(ctx->zerobus_sdk);
-            flb_free(ctx);
-            return -1;
+        }
+
+        /*
+         * Stream ownership depends on the worker model:
+         *   workers == 0 -> no worker thread, so the single stream lives on the
+         *                   context and is created here (on the main thread's
+         *                   deep stack, away from the shallow flush coroutine).
+         *   workers  > 0 -> each worker opens its own stream in
+         *                   cb_zerobus_worker_init; nothing to create here.
+         */
+        if (ins->tp_workers == 0) {
+            ctx->zerobus_stream = create_zerobus_stream(ins, config, ctx);
+            if (!ctx->zerobus_stream) {
+                if (ctx->proto_schema) {
+                    zerobus_proto_schema_free(ctx->proto_schema);
+                    ctx->proto_schema = NULL;
+                }
+                zerobus_sdk_free(ctx->zerobus_sdk);
+                flb_free(ctx);
+                return -1;
+            }
         }
     }
 
-    flb_plg_info(ins, "initialized: ingestion_endpoint=%s unity_catalog_endpoint=%s table_name=%s",
-                 ctx->ingestion_endpoint, ctx->unity_catalog_endpoint, ctx->table_name);
+    flb_plg_info(ins, "initialized: ingestion_endpoint=%s unity_catalog_endpoint=%s table_name=%s workers=%d",
+                 ctx->ingestion_endpoint, ctx->unity_catalog_endpoint,
+                 ctx->table_name, ins->tp_workers);
 
     flb_output_set_context(ins, ctx);
+    return 0;
+}
+
+/*
+ * Per-worker init (only called when workers > 0). Each worker thread opens its
+ * own Zerobus stream - here, on the worker thread's deep stack, never on a flush
+ * coroutine - and stashes it in thread-local storage for cb_zerobus_flush. The
+ * SDK object and the protobuf encoder are shared from the context.
+ */
+static int cb_zerobus_worker_init(void *data, struct flb_config *config)
+{
+    struct flb_zerobus_context *ctx = data;
+    struct CZerobusStream *stream;
+
+    /* Formatter-test mode never ingests, so it needs no real stream. */
+    if (ctx->ins->test_mode == FLB_TRUE) {
+        return 0;
+    }
+
+    stream = create_zerobus_stream(ctx->ins, config, ctx);
+    if (!stream) {
+        flb_plg_error(ctx->ins, "worker failed to create its Zerobus stream");
+        return -1;
+    }
+
+    FLB_TLS_SET(zerobus_worker_stream, stream);
+    flb_plg_info(ctx->ins, "worker Zerobus stream created");
+    return 0;
+}
+
+static int cb_zerobus_worker_exit(void *data, struct flb_config *config)
+{
+    struct flb_zerobus_context *ctx = data;
+    struct CZerobusStream *stream;
+    (void) config;
+
+    if (ctx && ctx->ins->test_mode == FLB_TRUE) {
+        return 0;
+    }
+
+    stream = FLB_TLS_GET(zerobus_worker_stream);
+    if (stream) {
+        close_and_free_stream(stream);
+        FLB_TLS_SET(zerobus_worker_stream, NULL);
+    }
     return 0;
 }
 
@@ -507,6 +603,7 @@ static void cb_zerobus_flush(struct flb_event_chunk *event_chunk,
     char **json_records;
     struct CResult ingest_result;
     struct CResult wait_result;
+    struct CZerobusStream *stream;
     int64_t last_offset;
     int start;
     int end;
@@ -529,14 +626,16 @@ static void cb_zerobus_flush(struct flb_event_chunk *event_chunk,
                   event_chunk->size);
 
     /*
-     * The stream is created once in cb_zerobus_init and reused for the life of
-     * the plugin; the SDK recovers/reconnects it in place on its own worker
-     * threads (the recovery* options). Flush never rebuilds it - doing so would
-     * run the SDK's synchronous TLS handshake on the shallow flush coroutine
-     * stack. This guard should never fire; if it ever does, retry rather than
-     * dereference a NULL stream.
+     * Pick the stream to ingest on: the calling worker's own stream (workers >
+     * 0, set in cb_zerobus_worker_init) or the single shared one (workers == 0).
+     * Streams are created off the flush coroutine - on a worker thread or the
+     * main thread - because the SDK's synchronous TLS handshake would overflow
+     * the shallow coroutine stack. The SDK recovers/reconnects a stream in place
+     * on its own threads, so flush never rebuilds it. This guard should never
+     * fire; if it does, retry rather than dereference a NULL stream.
      */
-    if (!ctx->zerobus_stream) {
+    stream = zerobus_active_stream(ctx);
+    if (!stream) {
         flb_plg_error(ctx->ins, "no active Zerobus stream; cannot flush");
         FLB_OUTPUT_RETURN(FLB_RETRY);
     }
@@ -720,7 +819,7 @@ static void cb_zerobus_flush(struct flb_event_chunk *event_chunk,
             ingest_result.error_message = NULL;
             ingest_result.is_retryable = false;
             last_offset = zerobus_stream_ingest_proto_records(
-                ctx->zerobus_stream,
+                stream,
                 (const uint8_t *const *) (proto_records + start),
                 (const uintptr_t *) (proto_lens + start),
                 (uintptr_t) (end - start),
@@ -756,7 +855,7 @@ static void cb_zerobus_flush(struct flb_event_chunk *event_chunk,
                 wait_result.success = false;
                 wait_result.error_message = NULL;
                 wait_result.is_retryable = false;
-                if (!zerobus_stream_wait_for_offset(ctx->zerobus_stream,
+                if (!zerobus_stream_wait_for_offset(stream,
                                                     last_offset, &wait_result)) {
                     flb_plg_error(ctx->ins, "failed waiting for ack at offset %ld: %s",
                                   (long) last_offset,
@@ -820,7 +919,7 @@ static void cb_zerobus_flush(struct flb_event_chunk *event_chunk,
             ingest_result.error_message = NULL;
             ingest_result.is_retryable = false;
             last_offset = zerobus_stream_ingest_json_records(
-                ctx->zerobus_stream,
+                stream,
                 (const char *const *) (json_records + start),
                 (uintptr_t) (end - start),
                 &ingest_result
@@ -855,7 +954,7 @@ static void cb_zerobus_flush(struct flb_event_chunk *event_chunk,
                 wait_result.success = false;
                 wait_result.error_message = NULL;
                 wait_result.is_retryable = false;
-                if (!zerobus_stream_wait_for_offset(ctx->zerobus_stream,
+                if (!zerobus_stream_wait_for_offset(stream,
                                                     last_offset, &wait_result)) {
                     flb_plg_error(ctx->ins, "failed waiting for ack at offset %ld: %s",
                                   (long) last_offset,
@@ -907,8 +1006,12 @@ static int cb_zerobus_exit(void *data, struct flb_config *config)
         return 0;
     }
 
-    /* Cleanup Zerobus SDK resources */
-    close_and_free_stream(ctx);
+    /*
+     * Cleanup. The shared stream (workers == 0) lives here; per-worker streams
+     * (workers > 0) were already closed in cb_zerobus_worker_exit.
+     */
+    close_and_free_stream(ctx->zerobus_stream);
+    ctx->zerobus_stream = NULL;
 
     if (ctx->zerobus_sdk) {
         zerobus_sdk_free(ctx->zerobus_sdk);
@@ -1015,10 +1118,12 @@ static struct flb_config_map config_map[] = {
 struct flb_output_plugin out_zerobus_plugin = {
     .name         = "zerobus",
     .description  = "Send logs to Zerobus ingestion service",
-    .cb_init      = cb_zerobus_init,
-    .cb_flush     = cb_zerobus_flush,
-    .cb_exit      = cb_zerobus_exit,
-    .config_map   = config_map,
+    .cb_init        = cb_zerobus_init,
+    .cb_flush       = cb_zerobus_flush,
+    .cb_exit        = cb_zerobus_exit,
+    .cb_worker_init = cb_zerobus_worker_init,
+    .cb_worker_exit = cb_zerobus_worker_exit,
+    .config_map     = config_map,
     .test_formatter.callback = cb_zerobus_format_test,
-    .flags        = 0,
+    .flags          = 0,
 };
