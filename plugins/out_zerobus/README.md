@@ -14,42 +14,50 @@ the target table requires restarting Fluent Bit to pick it up.
 
 ## Build
 
-`CMakeLists.txt` sources the Zerobus SDK (including its C FFI) from a pinned Git
-commit that exposes the dynamic protobuf-schema functions
-(`zerobus_proto_schema_*`). At build time CMake:
+The plugin links the **prebuilt** Zerobus SDK C FFI library
+(`libzerobus_ffi`) + its `zerobus.h`, distributed as a
+[release asset](https://github.com/databricks/zerobus-sdk/releases) that already
+exports the dynamic protobuf-schema functions (`zerobus_proto_schema_*`) — no
+Rust/cargo toolchain is needed. The plugin calls the SDK FFI directly; there is
+no separate Rust crate.
 
-1. shallow-fetches the pinned SDK commit (default repo
-   `https://github.com/databricks/zerobus-sdk`, `ZEROBUS_SDK_GIT_REF` pinned to
-   the head of the `ffi-dynamic-protobuf-schema` branch behind PR #371 — bump it
-   to the merge commit on `main` once that lands) into the build tree, and
-2. builds its FFI **static** library (`libzerobus_ffi.a`) from source with
-   `cargo` — the prebuilt `.a` committed in the repo predates these functions,
-   so building from source guarantees the linked library matches the header.
+The library is **not bundled and not downloaded by the build** (so the build
+stays hermetic and offline-friendly). It must be installed on the build host,
+and the plugin is **disabled by default**. To build it:
 
-The plugin then links that static library (`-lresolv -lgcc_s` alongside
-`pthread dl m`, required by the SDK FFI's transitive dependencies) and calls the
-SDK FFI directly — there is no separate Rust crate.
+1. **Stage the library** (developer/CI convenience):
+   ```bash
+   scripts/fetch-zerobus-ffi.sh /opt/zerobus-ffi
+   ```
+   This downloads the pinned FFI release tarball, verifies its SHA-256, and lays
+   out the host platform's `lib/` + `include/`. (In a packaged build, the
+   library would instead come from a system package.)
 
-Build requirements:
-- a Rust toolchain (`cargo` on `PATH` or under `$HOME/.cargo/bin`);
-- **CMake ≥ 3.20** (a vendored `lib/cfl` requires it);
-- registry access for the SDK's Rust dependencies. When the build environment
-  cannot reach crates.io directly, CMake writes a `.cargo/config.toml` into the
-  SDK checkout routing through the Databricks internal crates proxy
-  (`crates-proxy.cloud.databricks.com`, the same mirror as
-  `universe/third_party/rust/config.toml`);
-- `-DFLB_CONFIG_YAML=Off` if the system lacks the YAML dev headers (the classic
-  `.conf` format does not need them).
-
-```bash
-cmake -B build -DFLB_CONFIG_YAML=Off . && cmake --build build --target fluent-bit-bin
-```
+2. **Configure with the plugin enabled**, pointing at the install prefix:
+   ```bash
+   cmake -B build -DFLB_CONFIG_YAML=Off \
+         -DFLB_OUT_ZEROBUS=On -DZEROBUS_FFI_PREFIX=/opt/zerobus-ffi .
+   cmake --build build --target fluent-bit-bin
+   ```
+   If the library is installed in a standard location, `-DZEROBUS_FFI_PREFIX`
+   can be omitted. If `FLB_OUT_ZEROBUS=On` but the library is not found, the
+   build prints a warning and disables the plugin.
 
 The resulting binary is `build/bin/fluent-bit`.
 
-To use a different commit/branch/tag or repo, or an existing local checkout
-(skipping the fetch), pass `-DZEROBUS_SDK_GIT_URL=…`,
-`-DZEROBUS_SDK_GIT_REF=<sha|branch|tag>`, or `-DZEROBUS_SDK_DIR=/path/to/checkout`.
+Build requirements:
+- **CMake ≥ 3.20** (a vendored `lib/cfl` requires it);
+- the Zerobus SDK FFI library + header installed on the build host;
+- `-DFLB_CONFIG_YAML=Off` if the system lacks the YAML dev headers (the classic
+  `.conf` format does not need them).
+
+The build **prefers the static archive** (`libzerobus_ffi.a`): static linking
+re-resolves glibc symbol versions against the host's libc, so the binary runs on
+older glibc than the released shared object was built against (the `.so` requires
+GLIBC_2.34+), and the result is self-contained (no runtime `.so` dependency). If
+only the shared library is installed it is used instead. Linking the static
+archive pulls in `-lresolv -lgcc_s` (DNS + stack-unwind symbols) alongside
+`pthread dl m`.
 
 ## Configuration
 

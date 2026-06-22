@@ -155,4 +155,7 @@ DEFINE_OPTION(FLB_OUT_TCP                     "Enable TCP output plugin"        
 DEFINE_OPTION(FLB_OUT_UDP                     "Enable UDP output plugin"                     ON)
 DEFINE_OPTION(FLB_OUT_VIVO_EXPORTER           "Enable Vivo exporter output plugin"           ON)
 DEFINE_OPTION(FLB_OUT_WEBSOCKET               "Enable Websocket output plugin"               ON)
-DEFINE_OPTION(FLB_OUT_ZEROBUS                 "Enable Zerobus output plugin"                 ON)
+# OFF by default: the plugin links the external Zerobus SDK FFI library
+# (libzerobus_ffi), which is not bundled. Enabling it requires the library to be
+# installed on the build host (see plugins/out_zerobus/README.md).
+DEFINE_OPTION(FLB_OUT_ZEROBUS                 "Enable Zerobus output plugin"                 OFF)
