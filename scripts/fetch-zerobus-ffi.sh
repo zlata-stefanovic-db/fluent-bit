@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 #
-# Stage the prebuilt Zerobus SDK FFI library + header into a prefix that the
-# Fluent Bit build can link against:
+# Stage the Zerobus SDK FFI library + header into a prefix that the Fluent Bit
+# build can link against via the -DZEROBUS_FFI_PREFIX fallback path:
 #
 #   scripts/fetch-zerobus-ffi.sh [PREFIX]
 #   cmake -B build -DFLB_OUT_ZEROBUS=On -DZEROBUS_FFI_PREFIX="$PREFIX" .
 #
-# This is a developer/CI convenience only — the build itself never downloads
-# anything (so it stays hermetic and offline-friendly for upstream packaging).
-# It downloads the FFI release tarball, verifies its SHA-256, and lays out the
-# host platform's library + header as <PREFIX>/lib and <PREFIX>/include.
+# This is a developer/CI convenience only. libzerobus_ffi is an external
+# dependency; in a packaged build it comes from a system package and CMake
+# discovers it via pkg-config (this script's prefix is the no-.pc fallback). The
+# build itself never downloads anything (so it stays hermetic and
+# offline-friendly for upstream packaging). This script downloads the FFI release
+# tarball, verifies its SHA-256, and lays out the host platform's library +
+# header as <PREFIX>/lib and <PREFIX>/include.
 #
 # Override the release with ZEROBUS_FFI_VERSION / ZEROBUS_FFI_SHA256.
 set -euo pipefail
@@ -42,7 +45,7 @@ tar xzf "$tarball" -C "$workdir"
 
 mkdir -p "${PREFIX}/lib" "${PREFIX}/include"
 cp "${workdir}/${platform}/zerobus.h" "${PREFIX}/include/"
-# Copy both the static and shared libraries; find_library prefers the shared one.
+# Copy both the static and shared libraries; discovery prefers the static archive.
 cp "${workdir}/${platform}/libzerobus_ffi."* "${PREFIX}/lib/"
 
 echo "Staged Zerobus SDK FFI ${ZEROBUS_FFI_VERSION} (${platform}) into ${PREFIX}"

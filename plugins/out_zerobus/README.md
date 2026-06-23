@@ -14,40 +14,47 @@ the target table requires restarting Fluent Bit to pick it up.
 
 ## Build
 
-The plugin links the **prebuilt** Zerobus SDK C FFI library
-(`libzerobus_ffi`) + its `zerobus.h`, distributed as a
-[release asset](https://github.com/databricks/zerobus-sdk/releases) that already
-exports the dynamic protobuf-schema functions (`zerobus_proto_schema_*`) — no
-Rust/cargo toolchain is needed. The plugin calls the SDK FFI directly; there is
-no separate Rust crate.
+The plugin links the Zerobus SDK C FFI library (`libzerobus_ffi`) + its
+`zerobus.h`, which already export the dynamic protobuf-schema functions
+(`zerobus_proto_schema_*`) — no Rust/cargo toolchain is needed. The plugin calls
+the SDK FFI directly; there is no separate Rust crate.
 
-The library is **not bundled and not downloaded by the build** (so the build
-stays hermetic and offline-friendly). It must be installed on the build host,
-and the plugin is **disabled by default**. To build it:
+`libzerobus_ffi` is an **external dependency**: it comes from a system package or
+is built from the [Zerobus SDK](https://github.com/databricks/zerobus-sdk). The
+build **never bundles or downloads it** (so it stays hermetic and
+offline-friendly), and the plugin is **disabled by default**. CMake discovers the
+library via **`pkg-config`** (preferred), falling back to a hand-installed prefix
+given with `-DZEROBUS_FFI_PREFIX`. To build it:
 
-1. **Stage the library** (developer/CI convenience):
+1. **Provide the library.** If it (and its `zerobus_ffi.pc`) is installed in a
+   standard location, `pkg-config` finds it automatically. Otherwise, stage a
+   prefix — a developer/CI convenience:
    ```bash
    scripts/fetch-zerobus-ffi.sh /opt/zerobus-ffi
    ```
    This downloads the pinned FFI release tarball, verifies its SHA-256, and lays
-   out the host platform's `lib/` + `include/`. (In a packaged build, the
-   library would instead come from a system package.)
+   out the host platform's `lib/` + `include/`.
 
-2. **Configure with the plugin enabled**, pointing at the install prefix:
+2. **Configure with the plugin enabled:**
    ```bash
+   # pkg-config path (library installed system-wide, or via PKG_CONFIG_PATH):
+   cmake -B build -DFLB_CONFIG_YAML=Off -DFLB_OUT_ZEROBUS=On .
+
+   # prefix fallback (staged prefix, no .pc file):
    cmake -B build -DFLB_CONFIG_YAML=Off \
          -DFLB_OUT_ZEROBUS=On -DZEROBUS_FFI_PREFIX=/opt/zerobus-ffi .
+
    cmake --build build --target fluent-bit-bin
    ```
-   If the library is installed in a standard location, `-DZEROBUS_FFI_PREFIX`
-   can be omitted. If `FLB_OUT_ZEROBUS=On` but the library is not found, the
-   build prints a warning and disables the plugin.
+   If `FLB_OUT_ZEROBUS=On` but the library is not found by either path, the build
+   prints a warning and disables the plugin.
 
 The resulting binary is `build/bin/fluent-bit`.
 
 Build requirements:
 - **CMake ≥ 3.20** (a vendored `lib/cfl` requires it);
-- the Zerobus SDK FFI library + header installed on the build host;
+- the Zerobus SDK FFI library + header available to the build (via `pkg-config`
+  or `-DZEROBUS_FFI_PREFIX`);
 - `-DFLB_CONFIG_YAML=Off` if the system lacks the YAML dev headers (the classic
   `.conf` format does not need them).
 
@@ -58,6 +65,58 @@ GLIBC_2.34+), and the result is self-contained (no runtime `.so` dependency). If
 only the shared library is installed it is used instead. Linking the static
 archive pulls in `-lresolv -lgcc_s` (DNS + stack-unwind symbols) alongside
 `pthread dl m`.
+
+### Platform support
+
+`libzerobus_ffi` is published for **Linux glibc only** (`x86_64` and `aarch64`).
+**Alpine / musl is not supported**: the SDK's native components have no musl build
+target (tracking [databricks/zerobus-sdk#324](https://github.com/databricks/zerobus-sdk/issues/324)).
+Note that the static-archive preference above only bridges *older glibc* — it does
+**not** bridge glibc → musl, which is a different C library entirely, so neither
+the `.a` nor the `.so` links on a musl host until an FFI musl build exists.
+
+Because the plugin is OFF by default and CMake auto-disables it when the library
+is not found, a build on an unsupported platform (e.g. Alpine) simply leaves
+`FLB_OUT_ZEROBUS` off with a warning rather than failing the build.
+
+### Obtaining `libzerobus_ffi`
+
+The library is needed only by the host **building** Fluent Bit, not by hosts
+running the resulting binary: because the plugin links it statically (above), the
+SDK is baked into the `fluent-bit` binary and runtime hosts need nothing extra.
+(Only the shared-library fallback would also require the `.so` at runtime.)
+
+There is **no vendored fallback** in this tree (unlike `out_kafka`, which bundles
+librdkafka): `libzerobus_ffi` is Rust, and building it from source would pull a
+Rust/cargo toolchain into Fluent Bit's build. So the builder must supply the
+library, in one of three ways:
+
+1. **System package (preferred end state).** When the library, `zerobus.h`, and a
+   `zerobus_ffi.pc` are installed in standard locations, `pkg-config` discovers
+   them automatically — just pass `-DFLB_OUT_ZEROBUS=On`, no prefix needed. (This
+   mirrors `out_kafka`'s `FLB_PREFER_SYSTEM_LIB_KAFKA` / `librdkafka-dev` path.)
+   No such package is published for Zerobus yet.
+
+2. **Build from the SDK source.** Clone the
+   [Zerobus SDK](https://github.com/databricks/zerobus-sdk) and `cargo build
+   --release` its FFI crate to produce `libzerobus_ffi.{a,so}`; copy that plus
+   `zerobus.h` into a prefix (`<prefix>/lib`, `<prefix>/include`) and configure
+   with `-DZEROBUS_FFI_PREFIX=<prefix>`.
+
+3. **Prebuilt release tarball (the dev/CI convenience).**
+   `scripts/fetch-zerobus-ffi.sh <prefix>` downloads the pinned FFI release
+   tarball from the SDK's GitHub releases, verifies its SHA-256, and lays out
+   `<prefix>/lib` + `<prefix>/include`; then configure with
+   `-DZEROBUS_FFI_PREFIX=<prefix>`. Bump `ZEROBUS_FFI_VERSION` (and its hash) in
+   that script to change versions.
+
+Each artifact and where it's used:
+
+| File | What it is | Required? |
+|------|------------|-----------|
+| `libzerobus_ffi.a` / `.so` | the compiled SDK FFI library (linked into the plugin) | yes |
+| `zerobus.h` | C header declaring the FFI functions | yes |
+| `zerobus_ffi.pc` | pkg-config metadata (paths + link flags) | optional — enables path 1's auto-discovery |
 
 ## Configuration
 

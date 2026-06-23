@@ -1371,26 +1371,48 @@ endif()
 
 # Zerobus SDK FFI
 # ===============
-# The Zerobus output plugin links the prebuilt Zerobus SDK FFI library
-# (libzerobus_ffi) + its zerobus.h header, distributed via the SDK's GitHub
-# releases (https://github.com/databricks/zerobus-sdk/releases). The library is
-# not bundled; it must be installed on the build host. Point CMake at a custom
-# install prefix with -DZEROBUS_FFI_PREFIX=/path (expects <prefix>/include and
-# <prefix>/lib). scripts/fetch-zerobus-ffi.sh stages a prefix for local/CI use.
+# The Zerobus output plugin links libzerobus_ffi + its zerobus.h header. This is
+# an external dependency, not bundled or fetched by the build: it comes from a
+# system package or is built from the SDK (https://github.com/databricks/zerobus-sdk),
+# keeping the build hermetic and offline-friendly. Discovery is via pkg-config
+# (preferred) and falls back to a hand-installed prefix set with
+# -DZEROBUS_FFI_PREFIX=/path (expects <prefix>/include and <prefix>/lib).
+# scripts/fetch-zerobus-ffi.sh stages such a prefix for local/CI use.
 if(FLB_OUT_ZEROBUS)
-  find_path(ZEROBUS_FFI_INCLUDE_DIR zerobus.h
-            HINTS "${ZEROBUS_FFI_PREFIX}/include")
-  # Prefer the static archive (libzerobus_ffi.a): static linking re-resolves
-  # glibc symbol versions against the host's libc, so the binary runs on older
-  # glibc than the prebuilt shared object was built against (the released .so
-  # requires GLIBC_2.34+). It also yields a self-contained binary. Fall back to
-  # the shared library if only that is installed.
-  find_library(ZEROBUS_FFI_LIB NAMES libzerobus_ffi.a zerobus_ffi
-               HINTS "${ZEROBUS_FFI_PREFIX}/lib")
+  # Primary discovery: pkg-config (the standard distro mechanism). When the SDK's
+  # zerobus_ffi.pc is installed, no prefix override or extra link flags are needed.
+  find_package(PkgConfig QUIET)
+  if(PKG_CONFIG_FOUND)
+    pkg_check_modules(ZEROBUS_FFI QUIET zerobus_ffi)
+  endif()
+
+  if(ZEROBUS_FFI_FOUND)
+    # Normalize pkg-config output into the variables the plugin links against.
+    # Prefer the static archive (and its transitive deps) when advertised.
+    set(ZEROBUS_FFI_INCLUDE_DIR ${ZEROBUS_FFI_INCLUDE_DIRS})
+    if(ZEROBUS_FFI_STATIC_LIBRARIES)
+      set(ZEROBUS_FFI_LIB ${ZEROBUS_FFI_STATIC_LIBRARIES})
+    else()
+      set(ZEROBUS_FFI_LIB ${ZEROBUS_FFI_LIBRARIES})
+    endif()
+  else()
+    # Fallback: a hand-installed prefix (dev hosts, or hosts without a .pc file).
+    # Prefer the static archive (libzerobus_ffi.a): static linking re-resolves
+    # glibc symbol versions against the host's libc, so the binary runs on older
+    # glibc than the prebuilt shared object was built against (the released .so
+    # requires GLIBC_2.34+). It also yields a self-contained binary. Fall back to
+    # the shared library if only that is installed.
+    find_path(ZEROBUS_FFI_INCLUDE_DIR zerobus.h
+              HINTS "${ZEROBUS_FFI_PREFIX}/include")
+    find_library(ZEROBUS_FFI_LIB NAMES libzerobus_ffi.a zerobus_ffi
+                 HINTS "${ZEROBUS_FFI_PREFIX}/lib")
+  endif()
+
   if(NOT ZEROBUS_FFI_INCLUDE_DIR OR NOT ZEROBUS_FFI_LIB)
     message(WARNING
       "FLB_OUT_ZEROBUS is enabled but the Zerobus SDK FFI library/header was not "
-      "found. Install libzerobus_ffi and set -DZEROBUS_FFI_PREFIX, or see "
+      "found. Install libzerobus_ffi (system package or built from the SDK) so "
+      "pkg-config can find it, or set -DZEROBUS_FFI_PREFIX. See "
       "plugins/out_zerobus/README.md. Disabling the plugin.")
     FLB_OPTION(FLB_OUT_ZEROBUS OFF)
   else()

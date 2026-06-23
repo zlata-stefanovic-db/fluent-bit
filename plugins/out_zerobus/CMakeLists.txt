@@ -1,7 +1,8 @@
 # The Zerobus SDK FFI library + header are located by the top-level build
-# (find_path/find_library, see the "Zerobus SDK FFI" block in CMakeLists.txt).
-# This plugin is only added when FLB_OUT_ZEROBUS is enabled and the library was
-# found, so ZEROBUS_FFI_INCLUDE_DIR / ZEROBUS_FFI_LIB are guaranteed set here.
+# (pkg-config, with a find_path/find_library prefix fallback — see the "Zerobus
+# SDK FFI" block in CMakeLists.txt). This plugin is only added when FLB_OUT_ZEROBUS
+# is enabled and the library was found, so ZEROBUS_FFI_INCLUDE_DIR /
+# ZEROBUS_FFI_LIB are guaranteed set here.
 set(src
     zerobus.c
     zerobus_util.c
